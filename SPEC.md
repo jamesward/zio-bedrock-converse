@@ -218,6 +218,31 @@ object Bedrock:
   ): TooledRequest[NT]
 ```
 
+### Multi-turn: `Bedrock.loop`
+
+```scala
+  /** Multi-turn agentic loop. Only ToolHandlers allowed (no ModelResponseTool).
+    * The terminal determines the reply shape. */
+  final class LoopRequest[NT <: NamedTuple.AnyNamedTuple]:
+    def system(s: String):              LoopRequest[NT]
+    def inferenceConfig(c: InferenceConfig): LoopRequest[NT]
+    def maxIterations(n: Int):          LoopRequest[NT]
+
+    def text:                              ZIO[Client & EnvOf[Hs], Error, String]
+    def asResponse:                        ZIO[Client & EnvOf[Hs], Error, Result[Output]]
+    def as[T <: Matchable: Schema]:        ZIO[Client & EnvOf[Hs], Error, T]
+    def asResponse[T <: Matchable: Schema]: ZIO[Client & EnvOf[Hs], Error, Result[T]]
+
+  /** Compile-time: NonEmptyTuple, AllTools[Hs], no ModelResponseTool. */
+  inline def loop[NT <: NamedTuple.AnyNamedTuple](
+    prompt: String,
+    tools:  NT,
+  )(using
+    inline ev:       NamedTuple.DropNames[NT] <:< NonEmptyTuple,
+    inline allTools: AllTools[NamedTuple.DropNames[NT]],
+  ): LoopRequest[NT]
+```
+
 ### Type-level helpers (high-level)
 
 Match types deriving the dependent positions of `fold`'s signature:
@@ -330,6 +355,24 @@ For `Bedrock.request`, the ZIO error channel is `Error | ErrorsOf[Hs]`. Handler 
 
 `.as[T]` and `.asResponse[T]` (low-level) thread an `outputConfig.textFormat = json_schema` derived from `Schema[T]`. The `withStrictObjects` helper recursively sets `additionalProperties: false` on every object schema — Bedrock rejects schemas that don't.
 
+## Loop dispatch model
+
+`Bedrock.loop(prompt, tools)` drives a bounded multi-turn loop:
+
+- Build wire request: `toolConfig.tools` from NamedTuple keys, `toolChoice = Auto`, `outputConfig` from terminal (`.as[T]` sets `json_schema`).
+- Loop (bounded by `maxIterations`, default 10):
+  - Send → wire response.
+  - If `tool_use` blocks present: dispatch each tool. Unknown tool / invalid input / handler failure → encode as error `tool_result` and feed back. Success → encode output and feed back. Append assistant + user turns. Loop.
+  - Else (model replied): return text or decode structured output via terminal.
+- If iterations exceed `maxIterations`: fail `Error.MaxIterations`.
+
+Key differences from `Bedrock.request`:
+- **Multi-turn**: tool results are sent back; model is re-invoked.
+- **Handler errors absorbed**: `ZIO.fail(e)` encoded via `Schema[E]`, fed back as `tool_result.status = Error`.
+- **No `ModelResponseTool` in user API**: reply shape from terminal.
+- **ZIO error channel**: only `Bedrock.Error` (wire/protocol + `MaxIterations`).
+- **Debug logging**: `ZIO.logDebug` at each iteration. Set log level to `DEBUG` to see.
+
 ## Mock layer
 
 Lives in `src/test/scala/.../BedrockMock.scala` — not in the production jar.
@@ -356,8 +399,8 @@ object BedrockMock:
 - **`bedrockRequestScenarios`** — exercises `Bedrock.request`. Run against the mock only (the failure / unknown-tool / unexpected-reply paths require deterministic responses that the live model can't be trusted to produce).
 
 ```
-BedrockMockSpec        — bedrockScenarios + bedrockRequestScenarios   vs mock
-BedrockIntegrationSpec — bedrockScenarios                              vs live
+BedrockMockSpec        — all scenarios (converse + request + loop)        vs mock
+BedrockIntegrationSpec — converse + request (live-friendly) + loop-live   vs live
 ```
 
 ```scala

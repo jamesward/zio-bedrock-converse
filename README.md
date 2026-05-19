@@ -6,13 +6,15 @@ authenticated with Bedrock [API keys](https://docs.aws.amazon.com/bedrock/latest
 - Typed end-to-end. No `DynamicValue` in the public API.
 - Tool input / output / error JSON Schemas derive from `zio.schema.Schema`.
 - Built on ZIO HTTP's `Client`.
-- Two single-turn APIs:
+- Three APIs:
   - **`Bedrock.converse`** — low-level. You drive the wire, including
     manual tool dispatch.
-  - **`Bedrock.request`** — high-level. Bundle handlers in a NamedTuple,
-    fold over the typed outcome. Tool errors flow through ZIO's error
-    channel as a typed union.
-- The multi-turn loop is set aside and will return as `Bedrock.loop`.
+  - **`Bedrock.request`** — high-level single-turn. Bundle handlers in a
+    NamedTuple, fold over the typed outcome. Tool errors flow through
+    ZIO's error channel as a typed union.
+  - **`Bedrock.loop`** — multi-turn agentic. Same handler NamedTuple,
+    but the framework dispatches tools and feeds results back
+    automatically. Terminals (`.text`, `.as[T]`) mirror `Bedrock.converse`.
 
 ## Install
 
@@ -76,6 +78,11 @@ object Bedrock:
   final class TooledRequest[NT <: NamedTuple.AnyNamedTuple]  // builder, terminal is .fold
 
   def request[NT](prompt: String, tools: NT): TooledRequest[NT]
+
+  // ─── multi-turn agentic loop ───
+  final class LoopRequest[NT <: NamedTuple.AnyNamedTuple]  // builder; terminals are .text / .as[T] / .asResponse
+
+  def loop[NT](prompt: String, tools: NT): LoopRequest[NT]
 ```
 
 `Bedrock.converse(...)` and `Bedrock.request(...)` are both **builders** —
@@ -187,6 +194,62 @@ Compile-time checks rejected at the `request` call site:
 - A tuple element that isn't a `ToolHandler` or a `ModelResponseTool`.
 - Both `ModelResponseTool.text` *and* `ModelResponseTool[A]` registered
   (mutually exclusive — the model either writes text or writes JSON).
+
+## Example: multi-turn agentic loop (`Bedrock.loop`)
+
+Same handler NamedTuple as `Bedrock.request`, but the framework drives
+the loop: dispatches tools, feeds results back to the model, repeats
+until the model produces a final reply or `maxIterations` is hit.
+
+Handler errors are encoded via `Schema[E]` and fed back to the model as
+`tool_result.status = Error` — the model can self-correct. They never
+surface in the ZIO error channel.
+
+```scala
+import com.jamesward.zio_bedrock_converse.Bedrock
+import com.jamesward.zio_bedrock_converse.Bedrock.*
+import zio.*
+import zio.http.Client
+import zio.schema.{Schema, derived}
+
+case class WeatherInput(city: String) derives Schema
+case class WeatherOutput(temperatureF: Int, conditions: String) derives Schema
+case class Forecast(city: String, summary: String) derives Schema
+
+def get_weather(in: WeatherInput): WeatherOutput =
+  WeatherOutput(64, "foggy")
+
+object AgentLoop extends ZIOAppDefault:
+  def run =
+    val tools = (
+      weather = ToolHandler.fromPure(get_weather, "Get the current weather for a US city."),
+    )
+
+    // Text reply
+    Bedrock.loop("What is the weather in Denver?", tools)
+      .text
+      .debug("answer")
+      .provide(Client.default, Bedrock.Client.live)
+
+    // Or structured reply
+    Bedrock.loop("Weather of Denver? Respond as a Forecast.", tools)
+      .as[Forecast]
+      .debug("forecast")
+      .provide(Client.default, Bedrock.Client.live)
+```
+
+Configuration:
+
+```scala
+Bedrock.loop("…", tools)
+  .system("You are concise.")
+  .inferenceConfig(InferenceConfig(maxTokens = 500))
+  .maxIterations(5)    // default is 10
+  .text
+```
+
+Debug logging is built in at `ZIO.logDebug` level — set your ZIO log
+level to `DEBUG` to see each iteration's tool dispatches and replies.
 
 ## Example: low-level tools (`Bedrock.converse`)
 

@@ -322,3 +322,120 @@ object SharedSpec:
     tooledRequestUnknownTool,
     tooledRequestUnexpectedReply,
   )
+
+  // ---------- Bedrock.loop scenarios (multi-turn, mock-only) ----------
+
+  /** Single tool dispatch → model replies on second turn. */
+  val loopSingleTool: BedrockScenario = new BedrockScenario:
+    val name = "loop: single tool dispatch then text reply"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Denver")),
+      BedrockMock.MockBehavior.Reply("It is 64F and foggy in Denver."),
+    )
+    def run =
+      val tools = (
+        weather = ToolHandler.fromPure(get_weather, "Get the weather."),
+      )
+      Bedrock.loop("Weather of Denver?", tools).text.map: text =>
+        assertTrue(text.toLowerCase.contains("foggy"))
+
+  /** Two tool dispatches before the model replies. */
+  val loopMultiTool: BedrockScenario = new BedrockScenario:
+    val name = "loop: two tool dispatches then text reply"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Denver")),
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Seattle")),
+      BedrockMock.MockBehavior.Reply("Denver: 64F foggy. Seattle: 64F foggy."),
+    )
+    def run =
+      val tools = (
+        weather = ToolHandler.fromPure(get_weather, "Get the weather."),
+      )
+      Bedrock.loop("Weather of Denver and Seattle?", tools).text.map: text =>
+        assertTrue(text.toLowerCase.contains("denver"))
+
+  /** Handler fails → error fed back to model → model replies. */
+  val loopHandlerError: BedrockScenario = new BedrockScenario:
+    val name = "loop: handler error fed back, model recovers with reply"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("population"), PopulationInput("Atlantis")),
+      BedrockMock.MockBehavior.Reply("I couldn't find the population of Atlantis."),
+    )
+    def run =
+      val tools = (
+        population = get_population.asHandler("Get the population."),
+      )
+      Bedrock.loop("Population of Atlantis?", tools)
+        .text
+        .provideSomeLayer[Bedrock.Client](populationServiceFailing)
+        .map: text =>
+          assertTrue(text.toLowerCase.contains("atlantis"))
+
+  /** Max iterations exceeded. */
+  val loopMaxIterations: BedrockScenario = new BedrockScenario:
+    val name = "loop: maxIterations exceeded → Error.MaxIterations"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Denver")),
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Denver")),
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Denver")),
+    )
+    def run =
+      val tools = (
+        weather = ToolHandler.fromPure(get_weather, "Get the weather."),
+      )
+      Bedrock.loop("Weather?", tools)
+        .maxIterations(2)
+        .text
+        .either
+        .map:
+          case Left(_: Bedrock.Error.MaxIterations) => assertCompletes
+          case Left(other)                          => assertNever(s"expected MaxIterations, got $other")
+          case Right(r)                             => assertNever(s"expected failure, got $r")
+
+  /** Structured reply via .as[Forecast]. */
+  val loopStructuredReply: BedrockScenario = new BedrockScenario:
+    val name = "loop: structured reply via .as[Forecast]"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Seattle")),
+      BedrockMock.MockBehavior.ReplyJson(Forecast(city = "Seattle", summary = "64F foggy")),
+    )
+    def run =
+      val tools = (
+        weather = ToolHandler.fromPure(get_weather, "Get the weather."),
+      )
+      Bedrock.loop("Weather of Seattle?", tools).as[Forecast].map: f =>
+        assertTrue(
+          f.city == "Seattle",
+          f.summary.contains("64"),
+        )
+
+  val bedrockLoopScenarios: List[BedrockScenario] = List(
+    loopSingleTool,
+    loopMultiTool,
+    loopHandlerError,
+    loopMaxIterations,
+    loopStructuredReply,
+  )
+
+  // ---------- Bedrock.loop integration-friendly scenarios ----------
+
+  /** A simple loop scenario that works against the live model: register
+    * a weather tool, ask for weather, model should call it and reply. */
+  val loopIntegrationWeather: BedrockScenario = new BedrockScenario:
+    val name = "loop-live: weather tool dispatch + text reply"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("weather"), WeatherInput("Denver")),
+      BedrockMock.MockBehavior.Reply("It is 64F and foggy in Denver."),
+    )
+    def run =
+      val tools = (
+        weather = ToolHandler.fromPure(get_weather, "Get the current weather (temperature in F and conditions) for a US city."),
+      )
+      Bedrock.loop("What is the weather in Denver? Use the weather tool.", tools)
+        .text
+        .map: text =>
+          assertTrue(text.nonEmpty)
+
+  val bedrockLoopIntegrationScenarios: List[BedrockScenario] = List(
+    loopIntegrationWeather,
+  )

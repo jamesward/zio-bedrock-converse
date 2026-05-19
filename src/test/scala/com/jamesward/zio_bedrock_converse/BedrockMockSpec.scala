@@ -17,5 +17,7 @@ object BedrockMockSpec extends ZIOSpecDefault:
   def spec = suite("Bedrock Mock")(
     (SharedSpec.bedrockScenarios
       ++ SharedSpec.bedrockRequestScenarios
-      ++ SharedSpec.bedrockRequestMockOnlyScenarios).map(asTest)*
+      ++ SharedSpec.bedrockRequestMockOnlyScenarios
+      ++ SharedSpec.bedrockLoopScenarios
+      ++ SharedSpec.bedrockLoopIntegrationScenarios).map(asTest)*
   )
