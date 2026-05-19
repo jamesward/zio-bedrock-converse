@@ -37,7 +37,7 @@ object BedrockIntegrationSpec extends ZIOSpecDefault:
     (SharedSpec.bedrockScenarios
       ++ SharedSpec.bedrockRequestScenarios
       ++ SharedSpec.bedrockLoopIntegrationScenarios
-      ++ List(SharedSpec.textStreamScenario, SharedSpec.loopTextStreamScenario, SharedSpec.loopAsStreamScenario)).map(asTest)*
+      ++ List(SharedSpec.textStreamScenario, SharedSpec.loopTextStreamScenario, SharedSpec.loopAsStreamScenario, SharedSpec.loopPrimitiveInputHandler)).map(asTest)*
   ).provideSomeShared[Scope](Client.default, testLayer)
     @@ ifEnvSet("AWS_BEARER_TOKEN_BEDROCK")
     @@ withLiveClock

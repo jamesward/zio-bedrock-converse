@@ -409,12 +409,51 @@ object SharedSpec:
           f.summary.contains("64"),
         )
 
+  val loopInfallibleHandler: BedrockScenario = new BedrockScenario:
+    val name = "loop: infallible effectful handler (E = Nothing) compiles and runs"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("randomLetters"), 5),
+      BedrockMock.MockBehavior.Reply("Here are your letters: abcde"),
+    )
+    def run =
+      val tools = (
+        randomLetters = ToolHandler(
+          (n: Int) => zio.Random.nextPrintableChar.replicateZIO(n).map(_.mkString),
+          "generate n random letters",
+        ),
+      )
+      Bedrock.loop("Generate 5 random letters", tools).text.map: t =>
+        assertTrue(t.nonEmpty)
+
+  val loopPrimitiveInputHandler: BedrockScenario = new BedrockScenario:
+    val name = "loop: primitive input type (Int) works with Bedrock"
+    val mockScript = List(
+      BedrockMock.MockBehavior.CallTool(ToolName("randomLetters"), 5),
+      BedrockMock.MockBehavior.Reply("abcde"),
+    )
+    def run =
+      defer:
+        val ref = Ref.make(0).run
+
+        val tools = (
+          randomLetters = ToolHandler(
+            (n: Int) => ref.set(n) *> Random.nextPrintableChar.replicateZIO(n).map(_.mkString),
+            "generate n random letters. You MUST call this tool.",
+          ),
+        )
+
+        val t = Bedrock.loop("You must call the randomLetters tool with the value 5. Do not respond without calling the tool first.", tools).text.run
+
+        assertTrue(t.nonEmpty, ref.get.run == 5)
+
   val bedrockLoopScenarios: List[BedrockScenario] = List(
     loopSingleTool,
     loopMultiTool,
     loopHandlerError,
     loopMaxIterations,
     loopStructuredReply,
+    loopInfallibleHandler,
+    loopPrimitiveInputHandler,
   )
 
   // ---------- Bedrock.loop integration-friendly scenarios ----------

@@ -17,7 +17,7 @@ private[zio_bedrock_converse] object Tools:
     outputConfig: Option[Wire.OutputConfig],
   ): Wire.ConverseRequest =
     val messages = cfg.messages.map: m =>
-      val wireContent = m.content.map(Bedrock.toWireContentBlock)
+      val wireContent = m.content.map(Helpers.toWireContentBlock)
       Wire.WireMessage(role = m.role, content = wireContent)
     val system = cfg.system match
       case null => Nil

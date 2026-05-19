@@ -2,6 +2,7 @@ package com.jamesward.zio_bedrock_converse.internal
 
 import com.jamesward.zio_bedrock_converse.Bedrock.*
 import com.jamesward.zio_bedrock_converse.internal.Codecs.{given, *}
+import zio.Chunk
 import zio.http.endpoint.openapi.JsonSchema
 import zio.schema.annotation.{caseName, discriminatorName, noDiscriminator}
 import zio.schema.{DynamicValue, Schema, derived}
@@ -21,6 +22,18 @@ import java.util.Base64
  * the library's public surface.
  */
 private[zio_bedrock_converse] object Wire:
+
+  /** Bedrock requires tool inputSchema to be type: "object". If the
+    * schema is a primitive/array, wrap it in an object with a single
+    * "value" property. */
+  private def ensureObjectSchema(js: JsonSchema): JsonSchema =
+    js match
+      case _: JsonSchema.Object => js
+      case _ => JsonSchema.Object(
+        properties           = Map("value" -> js),
+        additionalProperties = Left(false),
+        required             = Chunk("value"),
+      )
 
   // ---------- Media / content blocks ----------
 
@@ -159,10 +172,10 @@ private[zio_bedrock_converse] object Wire:
         t => Wire(
           name        = t.name,
           description = t.description,
-          inputSchema = InputSchema(JsonSchema.fromZSchema(
+          inputSchema = InputSchema(ensureObjectSchema(JsonSchema.fromZSchema(
             t.schemaI,
             JsonSchema.SchemaRef(JsonSchema.SchemaSpec.JsonSchema, JsonSchema.SchemaStyle.Inline),
-          )),
+          ))),
           strict      = t.strict,
         ),
       )

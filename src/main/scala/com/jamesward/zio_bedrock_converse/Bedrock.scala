@@ -1,7 +1,7 @@
 package com.jamesward.zio_bedrock_converse
 
 import com.jamesward.zio_bedrock_converse.internal.Codecs.given
-import com.jamesward.zio_bedrock_converse.internal.{Codecs, Http, Tools, Wire}
+import com.jamesward.zio_bedrock_converse.internal.{Codecs, Helpers, Http, TooledRequestImpl, Tools, Wire}
 import zio.*
 import zio.direct.*
 import zio.http.{Client as HClient, Status}
@@ -182,10 +182,10 @@ object Bedrock:
 
   /** A content block in a [[Message]].
     *
-    *  - [[Text]]       — plain assistant text or user prompt.
-    *  - [[ToolUse]]    — model's call into a registered tool. Surface
+    *  - `Text`       — plain assistant text or user prompt.
+    *  - `ToolUse`    — model's call into a registered tool. Surface
     *                     when the response's `stopReason` is `ToolUse`.
-    *  - [[ToolResult]] — caller's reply with the tool's output. Send
+    *  - `ToolResult` — caller's reply with the tool's output. Send
     *                     this back in a follow-up `RequestConfig` so the
     *                     model can continue.
     *
@@ -327,7 +327,7 @@ object Bedrock:
     *  - `R` — environment the handler needs.
     *  - `E` — error the handler can fail with (must have a `Schema`).
     *  - `A` — output the handler produces (must have a `Schema`). */
-  final class ToolHandler[-I, -R, +E <: Matchable, +A <: Matchable] private[zio_bedrock_converse] (
+  final class ToolHandler[-I, -R, +E, +A <: Matchable] private[zio_bedrock_converse] (
     val description: String,
     private[zio_bedrock_converse] val inputSchema:  Schema[?],
     private[zio_bedrock_converse] val errorSchema:  Schema[?],
@@ -338,9 +338,9 @@ object Bedrock:
   object ToolHandler:
 
     /** Build a `ToolHandler` from an effectful function. `Schema[E]` is
-      * required so future `Bedrock.loop` support can wire-encode the
-      * error when feeding it back to the model. */
-    def apply[I: Schema, R, E <: Matchable: Schema, A <: Matchable: Schema](
+      * required so `Bedrock.loop` can wire-encode the error when feeding
+      * it back to the model. */
+    def apply[I: Schema, R, E: Schema, A <: Matchable: Schema](
       f:           I => ZIO[R, E, A],
       description: String,
     ): ToolHandler[I, R, E, A] =
@@ -348,6 +348,20 @@ object Bedrock:
         description,
         summon[Schema[I]],
         summon[Schema[E]],
+        summon[Schema[A]],
+        f,
+      )
+
+    /** Build a `ToolHandler` from an infallible effectful function
+      * (`E = Nothing`). No `Schema[E]` needed. */
+    def apply[I: Schema, R, A <: Matchable: Schema](
+      f:           I => URIO[R, A],
+      description: String,
+    )(using ev: DummyImplicit): ToolHandler[I, R, Nothing, A] =
+      new ToolHandler[I, R, Nothing, A](
+        description,
+        summon[Schema[I]],
+        summon[Schema[Nothing]],
         summon[Schema[A]],
         f,
       )
@@ -373,7 +387,7 @@ object Bedrock:
       ToolHandler.fromPure(f, description)
 
   /** Effectful-function `.asHandler` extension. Requires `Schema[E]`. */
-  extension [I: Schema, R, E <: Matchable: Schema, A <: Matchable: Schema](f: I => ZIO[R, E, A])
+  extension [I: Schema, R, E: Schema, A <: Matchable: Schema](f: I => ZIO[R, E, A])
     def asHandler(description: String): ToolHandler[I, R, E, A] =
       ToolHandler(f, description)
 
@@ -415,7 +429,7 @@ object Bedrock:
   object AllTools:
     given empty: AllTools[EmptyTuple] = new AllTools[EmptyTuple] {}
 
-    given consHandler[I, R, E <: Matchable, A <: Matchable, Tail <: Tuple](
+    given consHandler[I, R, E, A <: Matchable, Tail <: Tuple](
       using AllTools[Tail],
     ): AllTools[ToolHandler[I, R, E, A] *: Tail] =
       new AllTools[ToolHandler[I, R, E, A] *: Tail] {}
@@ -439,7 +453,7 @@ object Bedrock:
 
   /** Aggregated typed-error union of every `ToolHandler` in `Hs`.
     * `ModelResponseTool` cases contribute nothing. */
-  type ErrorsOf[Hs <: Tuple] <: Matchable = Hs match
+  type ErrorsOf[Hs <: Tuple] = Hs match
     case ToolHandler[?, ?, e, ?] *: rest => e | ErrorsOf[rest]
     case _                       *: rest => ErrorsOf[rest]
     case EmptyTuple                       => Nothing
@@ -642,8 +656,8 @@ object Bedrock:
         client.send(Tools.toWire(cfg, outputConfig = None)).map: wire =>
           val publicContent = wire.output.message.content.collect:
             case Wire.ContentBlock.Text(t)        => ContentBlock.Text(t)
-            case Wire.ContentBlock.ToolUse(tu)    => fromWireToolUse(tu)
-            case Wire.ContentBlock.ToolResult(tr) => fromWireToolResult(tr)
+            case Wire.ContentBlock.ToolUse(tu)    => Helpers.fromWireToolUse(tu)
+            case Wire.ContentBlock.ToolResult(tr) => Helpers.fromWireToolResult(tr)
           Result(
             output     = Output(Message(wire.output.message.role, publicContent)),
             stopReason = wire.stopReason,
@@ -667,7 +681,7 @@ object Bedrock:
       )
       // Bedrock requires every object schema in the structured-output
       // schema document to set `additionalProperties: false`.
-      val outputJsonSchema = withStrictObjects(rawJsonSchema).toJson
+      val outputJsonSchema = Helpers.withStrictObjects(rawJsonSchema).toJson
       val outCfg = Wire.OutputConfig(Wire.TextFormat.JsonSchema(
         Wire.JsonSchemaStructure(Wire.JsonSchemaSpec(
           schema = outputJsonSchema,
@@ -711,7 +725,7 @@ object Bedrock:
     private[zio_bedrock_converse] val prompt:    String,
     private[zio_bedrock_converse] val systemMsg: String | Null,
     private[zio_bedrock_converse] val infCfg:    InferenceConfig | Null,
-    private[zio_bedrock_converse] val handlers:  Map[ToolName, ToolHandler[?, ?, ? <: Matchable, ? <: Matchable]],
+    private[zio_bedrock_converse] val handlers:  Map[ToolName, ToolHandler[?, ?, ?, ? <: Matchable]],
     private[zio_bedrock_converse] val replyTool: Option[(ToolName, ModelResponseTool[? <: Matchable])],
   ):
     /** Set or replace the system message. */
@@ -766,139 +780,7 @@ object Bedrock:
     private def foldImpl[R <: Matchable](
       foldByName: Map[ToolName, Any => R],
     ): ZIO[Client, Any, Result[R]] =
-      ZIO.serviceWithZIO[Client]: client =>
-        val wireReq = buildWireRequest()
-        client.send(wireReq).flatMap: wire =>
-          dispatch[R](wire, foldByName)
-
-    /** Build the wire request from the registered handlers + reply
-      * tool. Each handler becomes a wire `ToolDef.ToolSpec` whose name
-      * is the registered key. `toolChoice` defaults to `Any` (forced
-      * dispatch) when no reply tool is present, `Auto` when one is. */
-    private def buildWireRequest(): Wire.ConverseRequest =
-      val wireToolDefs: List[Wire.ToolDef] = handlers.toList.map: (name, h) =>
-        Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
-          name        = name,
-          description = Some(h.description),
-          strict      = None,
-          schema      = h.inputSchema,
-        ))
-      val wireToolConfig: Option[Wire.ToolConfig] =
-        if wireToolDefs.isEmpty then None
-        else Some(Wire.ToolConfig(
-          tools      = wireToolDefs,
-          toolChoice = Some(replyTool match
-            case Some(_) => Wire.ToolChoice.Auto(Wire.EmptyObject())
-            case None    => Wire.ToolChoice.Any(Wire.EmptyObject())),
-        ))
-      val wireOutputConfig: Option[Wire.OutputConfig] = replyTool match
-        case Some((_, m: ModelResponseTool.Structured[?])) =>
-          val rawJsonSchema = zio.http.endpoint.openapi.JsonSchema.fromZSchema(
-            m.outputSchema.asInstanceOf[Schema[Any]],
-            zio.http.endpoint.openapi.JsonSchema.SchemaRef(
-              zio.http.endpoint.openapi.JsonSchema.SchemaSpec.JsonSchema,
-              zio.http.endpoint.openapi.JsonSchema.SchemaStyle.Inline,
-            ),
-          )
-          val outputJsonSchema = withStrictObjects(rawJsonSchema).toJson
-          Some(Wire.OutputConfig(Wire.TextFormat.JsonSchema(
-            Wire.JsonSchemaStructure(Wire.JsonSchemaSpec(
-              schema = outputJsonSchema,
-              name   = "structured_output",
-            )),
-          )))
-        case _ => None
-      val wireSystem: List[Wire.SystemContentBlock] = systemMsg match
-        case null => Nil
-        case s    => List(Wire.SystemContentBlock.Text(s))
-      val wireInference: Option[InferenceConfig] =
-        if infCfg.asInstanceOf[AnyRef] eq null then None
-        else Some(infCfg.asInstanceOf[InferenceConfig])
-      Wire.ConverseRequest(
-        messages        = List(Wire.WireMessage(
-          role    = Role.User,
-          content = List(Wire.ContentBlock.Text(prompt)),
-        )),
-        system          = wireSystem,
-        inferenceConfig = wireInference,
-        toolConfig      = wireToolConfig,
-        outputConfig    = wireOutputConfig,
-      )
-
-    /** Parse the wire response, dispatch to a handler or the reply
-      * tool, surface failures via the ZIO error channel. */
-    private def dispatch[R <: Matchable](
-      wire:       Wire.ConverseResponse,
-      foldByName: Map[ToolName, Any => R],
-    ): ZIO[Any, Any, Result[R]] =
-      val toolUseOpt = wire.output.message.content.collectFirst:
-        case Wire.ContentBlock.ToolUse(tu) => tu
-      toolUseOpt match
-        case Some(tu) =>
-          handlers.get(tu.name) match
-            case None =>
-              ZIO.fail(Error.UnknownTool(tu.name))
-            case Some(handler) =>
-              handler.inputSchema
-                .asInstanceOf[Schema[Any]]
-                .fromDynamic(tu.input) match
-                  case Left(err) =>
-                    ZIO.fail(Error.InvalidToolInput(tu.name, err))
-                  case Right(typedInput) =>
-                    val handlerErased = handler.handler.asInstanceOf[Any => ZIO[Any, Any, Any]]
-                    handlerErased(typedInput).map: a =>
-                      val fn = foldByName.getOrElse(
-                        tu.name,
-                        throw new IllegalStateException(s"No fold case for ${tu.name}"),
-                      )
-                      Result(
-                        output     = fn(a),
-                        stopReason = wire.stopReason,
-                        usage      = wire.usage,
-                        metrics    = wire.metrics,
-                      )
-        case None =>
-          // No tool dispatch: must have come from the reply tool path.
-          replyTool match
-            case None =>
-              ZIO.fail(Error.UnexpectedReply(
-                "model returned no tool_use and no ModelResponseTool was registered",
-              ))
-            case Some((replyName, tool)) =>
-              val textOpt = wire.output.message.content.collectFirst:
-                case Wire.ContentBlock.Text(t) => t
-              textOpt match
-                case None =>
-                  ZIO.fail(Error.UnexpectedReply(
-                    "expected a text reply but the response had no text block",
-                  ))
-                case Some(text) =>
-                  tool match
-                    case _: ModelResponseTool.text.type =>
-                      val fn = foldByName(replyName)
-                      ZIO.succeed(Result(
-                        output     = fn(text),
-                        stopReason = wire.stopReason,
-                        usage      = wire.usage,
-                        metrics    = wire.metrics,
-                      ))
-                    case s: ModelResponseTool.Structured[?] =>
-                      val codec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[Any](
-                        Codecs.codecConfig,
-                      )(using s.outputSchema.asInstanceOf[Schema[Any]])
-                      codec.decode(Chunk.fromArray(
-                        text.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                      )) match
-                        case Right(value) =>
-                          val fn = foldByName(replyName)
-                          ZIO.succeed(Result(
-                            output     = fn(value),
-                            stopReason = wire.stopReason,
-                            usage      = wire.usage,
-                            metrics    = wire.metrics,
-                          ))
-                        case Left(err) =>
-                          ZIO.fail(Error.StructuredDecode(text, err.message))
+      TooledRequestImpl.foldImpl[R](this, foldByName)
 
   object TooledRequest:
     /** Inline conversion of a user-supplied `cases: NamedTuple` into a
@@ -933,7 +815,7 @@ object Bedrock:
       val valuesList = tools.asInstanceOf[Tuple].toList
       val handlers = scala.collection.mutable.Map.empty[
         ToolName,
-        ToolHandler[?, ?, ? <: Matchable, ? <: Matchable],
+        ToolHandler[?, ?, ?, ? <: Matchable],
       ]
       var replyTool: Option[(ToolName, ModelResponseTool[? <: Matchable])] = None
       nameList.iterator.zip(valuesList.iterator).foreach: (n, v) =>
@@ -941,7 +823,7 @@ object Bedrock:
         v match
           case h: ToolHandler[?, ?, ?, ?] =>
             handlers(tn) = h.asInstanceOf[
-              ToolHandler[?, ?, ? <: Matchable, ? <: Matchable]
+              ToolHandler[?, ?, ?, ? <: Matchable]
             ]
           case mrt: ModelResponseTool[?] =>
             replyTool = Some((tn, mrt.asInstanceOf[ModelResponseTool[? <: Matchable]]))
@@ -1004,7 +886,7 @@ object Bedrock:
     private[zio_bedrock_converse] val systemMsg: String | Null,
     private[zio_bedrock_converse] val infCfg:    InferenceConfig | Null,
     private[zio_bedrock_converse] val maxIter:   Int,
-    private[zio_bedrock_converse] val handlers:  Map[ToolName, ToolHandler[?, ?, ? <: Matchable, ? <: Matchable]],
+    private[zio_bedrock_converse] val handlers:  Map[ToolName, ToolHandler[?, ?, ?, ? <: Matchable]],
   ):
     def system(s: String):              LoopRequest[NT] =
       new LoopRequest[NT](prompt, s, infCfg, maxIter, handlers)
@@ -1021,17 +903,17 @@ object Bedrock:
       * Tool-dispatch turns are consumed internally (no text emitted);
       * text deltas from the final reply stream through to the caller. */
     def textStream: ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String] =
-      runLoopStream(outputConfig = None).asInstanceOf[ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String]]
+      com.jamesward.zio_bedrock_converse.internal.LoopImpl.runLoopStream(this, outputConfig = None).asInstanceOf[ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String]]
 
     /** Stream all events from every turn, including intermediate tool calls.
       * Emits `ToolUseStart`, `ToolUseDelta`, `TextDelta`, `ReasoningDelta`,
       * `ContentBlockStop`, `MessageStop`, and `Metadata` from each iteration. */
     def asStream: ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent] =
-      runLoopEventStream(outputConfig = None).asInstanceOf[ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent]]
+      com.jamesward.zio_bedrock_converse.internal.LoopImpl.runLoopEventStream(this, outputConfig = None).asInstanceOf[ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent]]
 
     /** Full response envelope after the loop completes. */
     def asResponse: ZIO[Client & EnvOf[NamedTuple.DropNames[NT]], Error, Result[Output]] =
-      runLoop(outputConfig = None).map: (wire) =>
+      com.jamesward.zio_bedrock_converse.internal.LoopImpl.runLoop(this, outputConfig = None).map: (wire) =>
         val publicContent = wire.output.message.content.collect:
           case Wire.ContentBlock.Text(t) => ContentBlock.Text(t)
         Result(
@@ -1055,7 +937,7 @@ object Bedrock:
           zio.http.endpoint.openapi.JsonSchema.SchemaStyle.Inline,
         ),
       )
-      val outputJsonSchema = withStrictObjects(rawJsonSchema).toJson
+      val outputJsonSchema = Helpers.withStrictObjects(rawJsonSchema).toJson
       val outCfg = Wire.OutputConfig(Wire.TextFormat.JsonSchema(
         Wire.JsonSchemaStructure(Wire.JsonSchemaSpec(
           schema = outputJsonSchema,
@@ -1063,7 +945,7 @@ object Bedrock:
         )),
       ))
       val codec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[T](Codecs.codecConfig)
-      runLoop(outputConfig = Some(outCfg)).flatMap: wire =>
+      com.jamesward.zio_bedrock_converse.internal.LoopImpl.runLoop(this, outputConfig = Some(outCfg)).flatMap: wire =>
         val text = wire.output.message.content.collectFirst:
           case Wire.ContentBlock.Text(t) => t
         text match
@@ -1075,336 +957,6 @@ object Bedrock:
               case Left(err)    => ZIO.fail(Error.StructuredDecode(t, err.message))
       .asInstanceOf[ZIO[Client & EnvOf[NamedTuple.DropNames[NT]], Error, Result[T]]]
 
-    /** Core loop: send → dispatch tools → feed back → repeat until
-      * the model stops calling tools or maxIterations is hit. */
-    private def runLoop(
-      outputConfig: Option[Wire.OutputConfig],
-    ): ZIO[Client, Error, Wire.ConverseResponse] =
-      ZIO.serviceWithZIO[Client]: client =>
-        val wireToolDefs: List[Wire.ToolDef] = handlers.toList.map: (name, h) =>
-          Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
-            name        = name,
-            description = Some(h.description),
-            strict      = None,
-            schema      = h.inputSchema,
-          ))
-        val wireToolConfig: Option[Wire.ToolConfig] =
-          if wireToolDefs.isEmpty then None
-          else Some(Wire.ToolConfig(
-            tools      = wireToolDefs,
-            toolChoice = Some(Wire.ToolChoice.Auto(Wire.EmptyObject())),
-          ))
-        val wireSystem: List[Wire.SystemContentBlock] = systemMsg match
-          case null => Nil
-          case s    => List(Wire.SystemContentBlock.Text(s))
-        val wireInference: Option[InferenceConfig] =
-          if infCfg.asInstanceOf[AnyRef] eq null then None
-          else Some(infCfg.asInstanceOf[InferenceConfig])
-
-        val initialMessages = List(Wire.WireMessage(
-          role    = Role.User,
-          content = List(Wire.ContentBlock.Text(prompt)),
-        ))
-
-        def step(
-          messages:   List[Wire.WireMessage],
-          iterations: Int,
-        ): ZIO[Any, Error, Wire.ConverseResponse] =
-          if iterations > maxIter then ZIO.fail(Error.MaxIterations(iterations - 1))
-          else
-            val wireReq = Wire.ConverseRequest(
-              messages        = messages,
-              system          = wireSystem,
-              inferenceConfig = wireInference,
-              toolConfig      = wireToolConfig,
-              outputConfig    = outputConfig,
-            )
-            client.send(wireReq).flatMap: wire =>
-              val toolUses = wire.output.message.content.collect:
-                case Wire.ContentBlock.ToolUse(tu) => tu
-              if toolUses.nonEmpty then
-                val toolNames = toolUses.map(_.name).mkString(", ")
-                ZIO.logDebug(s"[Bedrock.loop] iteration=$iterations tool_use=[$toolNames]") *>
-                ZIO.foreach(toolUses)(dispatchTool).flatMap: results =>
-                  val toolResultMsg = Wire.WireMessage(
-                    role    = Role.User,
-                    content = results.toList.map(Wire.ContentBlock.ToolResult.apply),
-                  )
-                  step(messages :+ wire.output.message :+ toolResultMsg, iterations + 1)
-              else
-                val textPreview = wire.output.message.content.collectFirst:
-                  case Wire.ContentBlock.Text(t) => t.take(200)
-                .getOrElse("<no text>")
-                ZIO.logDebug(s"[Bedrock.loop] iteration=$iterations reply=${textPreview}") *>
-                ZIO.succeed(wire)
-
-        step(initialMessages, 1)
-
-    /** Streaming loop: every turn uses the streaming endpoint. Tool-use
-      * turns are consumed internally (buffered to extract tool calls,
-      * dispatched, results fed back). Text deltas from non-tool turns
-      * are emitted to the caller. */
-    /** Like runLoopStream but emits ALL StreamEvents (not just text). */
-    private def runLoopEventStream(
-      outputConfig: Option[Wire.OutputConfig],
-    ): ZStream[Client, Error, StreamEvent] =
-      ZStream.unwrap:
-        ZIO.serviceWith[Client]: client =>
-          val wireToolDefs: List[Wire.ToolDef] = handlers.toList.map: (name, h) =>
-            Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
-              name        = name,
-              description = Some(h.description),
-              strict      = None,
-              schema      = h.inputSchema,
-            ))
-          val wireToolConfig: Option[Wire.ToolConfig] =
-            if wireToolDefs.isEmpty then None
-            else Some(Wire.ToolConfig(
-              tools      = wireToolDefs,
-              toolChoice = Some(Wire.ToolChoice.Auto(Wire.EmptyObject())),
-            ))
-          val wireSystem: List[Wire.SystemContentBlock] = systemMsg match
-            case null => Nil
-            case s    => List(Wire.SystemContentBlock.Text(s))
-          val wireInference: Option[InferenceConfig] =
-            if infCfg.asInstanceOf[AnyRef] eq null then None
-            else Some(infCfg.asInstanceOf[InferenceConfig])
-          val initialMessages = List(Wire.WireMessage(
-            role    = Role.User,
-            content = List(Wire.ContentBlock.Text(prompt)),
-          ))
-
-          def streamStep(
-            messages:   List[Wire.WireMessage],
-            iterations: Int,
-          ): ZStream[Any, Error, StreamEvent] =
-            if iterations > maxIter then ZStream.fail(Error.MaxIterations(iterations - 1))
-            else
-              val wireReq = Wire.ConverseRequest(
-                messages        = messages,
-                system          = wireSystem,
-                inferenceConfig = wireInference,
-                toolConfig      = wireToolConfig,
-                outputConfig    = outputConfig,
-              )
-              val eventsStream = client.sendStreamEvents(wireReq)
-
-              ZStream.unwrap:
-                for
-                  toolUsesRef <- Ref.make(List.empty[(ToolUseId, ToolName)])
-                  inputBufRef <- Ref.make(new StringBuilder)
-                  completedRef <- Ref.make(List.empty[Wire.ToolUseContent])
-                yield
-                  // Emit every event AND collect tool-use data
-                  val emitAndCollect = eventsStream.mapZIO: event =>
-                    event match
-                      case Bedrock.StreamEvent.ToolUseStart(id, name) =>
-                        (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
-                          case (tools, buf) =>
-                            val flush = tools.lastOption match
-                              case Some((prevId, prevName)) if buf.nonEmpty =>
-                                import com.jamesward.zio_bedrock_converse.internal.Codecs.given
-                                val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
-                                val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
-                                  .getOrElse(zio.schema.DynamicValue.NoneValue)
-                                completedRef.update(_ :+ Wire.ToolUseContent(prevId, prevName, input))
-                              case _ => ZIO.unit
-                            flush *> toolUsesRef.set(tools :+ (id, name))
-                        .as(event)
-                      case Bedrock.StreamEvent.ToolUseDelta(_, inputJson) =>
-                        inputBufRef.update(_.append(inputJson)).as(event)
-                      case Bedrock.StreamEvent.ContentBlockStop(_) =>
-                        (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
-                          case (tools, buf) =>
-                            tools.lastOption match
-                              case Some((id, name)) if buf.nonEmpty =>
-                                import com.jamesward.zio_bedrock_converse.internal.Codecs.given
-                                val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
-                                val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
-                                  .getOrElse(zio.schema.DynamicValue.NoneValue)
-                                completedRef.update(_ :+ Wire.ToolUseContent(id, name, input)) *>
-                                toolUsesRef.update(_.init)
-                              case _ => ZIO.unit
-                        .as(event)
-                      case _ =>
-                        ZIO.succeed(event)
-
-                  // After stream ends, dispatch tools and recurse if needed
-                  emitAndCollect ++ ZStream.unwrap:
-                    completedRef.get.flatMap: toolUses =>
-                      if toolUses.isEmpty then
-                        ZIO.succeed(ZStream.empty)
-                      else
-                        ZIO.logDebug(s"[Bedrock.loop.asStream] iteration=$iterations tool_use=[${toolUses.map(_.name).mkString(", ")}]") *>
-                        ZIO.foreach(toolUses)(dispatchTool).map: results =>
-                          val assistantMsg = Wire.WireMessage(
-                            role    = Role.Assistant,
-                            content = toolUses.map(tu => Wire.ContentBlock.ToolUse(tu)),
-                          )
-                          val toolResultMsg = Wire.WireMessage(
-                            role    = Role.User,
-                            content = results.toList.map(Wire.ContentBlock.ToolResult.apply),
-                          )
-                          streamStep(messages :+ assistantMsg :+ toolResultMsg, iterations + 1)
-
-          streamStep(initialMessages, 1)
-
-    private def runLoopStream(
-      outputConfig: Option[Wire.OutputConfig],
-    ): ZStream[Client, Error, String] =
-      ZStream.unwrap:
-        ZIO.serviceWith[Client]: client =>
-          val wireToolDefs: List[Wire.ToolDef] = handlers.toList.map: (name, h) =>
-            Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
-              name        = name,
-              description = Some(h.description),
-              strict      = None,
-              schema      = h.inputSchema,
-            ))
-          val wireToolConfig: Option[Wire.ToolConfig] =
-            if wireToolDefs.isEmpty then None
-            else Some(Wire.ToolConfig(
-              tools      = wireToolDefs,
-              toolChoice = Some(Wire.ToolChoice.Auto(Wire.EmptyObject())),
-            ))
-          val wireSystem: List[Wire.SystemContentBlock] = systemMsg match
-            case null => Nil
-            case s    => List(Wire.SystemContentBlock.Text(s))
-          val wireInference: Option[InferenceConfig] =
-            if infCfg.asInstanceOf[AnyRef] eq null then None
-            else Some(infCfg.asInstanceOf[InferenceConfig])
-          val initialMessages = List(Wire.WireMessage(
-            role    = Role.User,
-            content = List(Wire.ContentBlock.Text(prompt)),
-          ))
-
-          def streamStep(
-            messages:   List[Wire.WireMessage],
-            iterations: Int,
-          ): ZStream[Any, Error, String] =
-            if iterations > maxIter then ZStream.fail(Error.MaxIterations(iterations - 1))
-            else
-              val wireReq = Wire.ConverseRequest(
-                messages        = messages,
-                system          = wireSystem,
-                inferenceConfig = wireInference,
-                toolConfig      = wireToolConfig,
-                outputConfig    = outputConfig,
-              )
-              // Stream this turn, collect all events to determine if it's a tool call
-              val eventsStream = client.sendStreamEvents(wireReq)
-
-              // We need to both emit text deltas AND detect tool_use.
-              // Strategy: collect all events, emit text deltas as they arrive,
-              // then after the stream ends, check if there were tool calls.
-              // Use a Ref to accumulate tool-use data while streaming.
-              ZStream.unwrap:
-                for
-                  toolUsesRef <- Ref.make(List.empty[(ToolUseId, ToolName)])
-                  inputBufRef <- Ref.make(new StringBuilder)
-                  completedRef <- Ref.make(List.empty[Wire.ToolUseContent])
-                yield
-                  val textAndCollect = eventsStream.mapZIO:
-                    case Bedrock.StreamEvent.TextDelta(text) =>
-                      ZIO.succeed(Some(text))
-                    case Bedrock.StreamEvent.ToolUseStart(id, name) =>
-                      // Flush prior tool's input buffer
-                      (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
-                        case (tools, buf) =>
-                          val flush = tools.lastOption match
-                            case Some((prevId, prevName)) if buf.nonEmpty =>
-                              import com.jamesward.zio_bedrock_converse.internal.Codecs.given
-                              val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
-                              val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
-                                .getOrElse(zio.schema.DynamicValue.NoneValue)
-                              completedRef.update(_ :+ Wire.ToolUseContent(prevId, prevName, input))
-                            case _ => ZIO.unit
-                          flush *> toolUsesRef.set(tools :+ (id, name))
-                      .as(None)
-                    case Bedrock.StreamEvent.ToolUseDelta(_, inputJson) =>
-                      inputBufRef.update(_.append(inputJson)).as(None)
-                    case Bedrock.StreamEvent.ContentBlockStop(_) =>
-                      // Flush current tool if any
-                      (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
-                        case (tools, buf) =>
-                          tools.lastOption match
-                            case Some((id, name)) if buf.nonEmpty =>
-                              import com.jamesward.zio_bedrock_converse.internal.Codecs.given
-                              val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
-                              val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
-                                .getOrElse(zio.schema.DynamicValue.NoneValue)
-                              completedRef.update(_ :+ Wire.ToolUseContent(id, name, input)) *>
-                              toolUsesRef.update(_.init)
-                            case _ => ZIO.unit
-                      .as(None)
-                    case _ =>
-                      ZIO.succeed(None)
-                  .collect { case Some(text) => text }
-
-                  // After the stream completes, check for tool uses and recurse
-                  textAndCollect ++ ZStream.unwrap:
-                    completedRef.get.flatMap: toolUses =>
-                      if toolUses.isEmpty then
-                        ZIO.succeed(ZStream.empty)
-                      else
-                        ZIO.logDebug(s"[Bedrock.loop.stream] iteration=$iterations tool_use=[${toolUses.map(_.name).mkString(", ")}]") *>
-                        ZIO.foreach(toolUses)(dispatchTool).map: results =>
-                          val assistantMsg = Wire.WireMessage(
-                            role    = Role.Assistant,
-                            content = toolUses.map(tu => Wire.ContentBlock.ToolUse(tu)),
-                          )
-                          val toolResultMsg = Wire.WireMessage(
-                            role    = Role.User,
-                            content = results.toList.map(Wire.ContentBlock.ToolResult.apply),
-                          )
-                          streamStep(messages :+ assistantMsg :+ toolResultMsg, iterations + 1)
-
-          streamStep(initialMessages, 1)
-
-    private def dispatchTool(
-      tu: Wire.ToolUseContent,
-    ): ZIO[Any, Nothing, Wire.ToolResultContent] =
-      handlers.get(tu.name) match
-        case None =>
-          ZIO.logDebug(s"[Bedrock.loop] dispatch unknown tool=${tu.name}") *>
-          ZIO.succeed(errorResult(tu.toolUseId, s"Unknown tool: ${tu.name}"))
-        case Some(handler) =>
-          handler.inputSchema.asInstanceOf[Schema[Any]].fromDynamic(tu.input) match
-            case Left(err) =>
-              ZIO.logDebug(s"[Bedrock.loop] dispatch tool=${tu.name} invalid_input=$err") *>
-              ZIO.succeed(errorResult(tu.toolUseId, s"Invalid input: $err"))
-            case Right(typedInput) =>
-              val handlerErased = handler.handler.asInstanceOf[Any => ZIO[Any, Any, Any]]
-              val outSchema     = handler.outputSchema.asInstanceOf[Schema[Any]]
-              val errSchema     = handler.errorSchema.asInstanceOf[Schema[Any]]
-              handlerErased(typedInput).foldZIO(
-                e =>
-                  ZIO.logDebug(s"[Bedrock.loop] dispatch tool=${tu.name} handler_error=$e").as {
-                    val errJson = errSchema.toDynamic(e)
-                    Wire.ToolResultContent(
-                      toolUseId = tu.toolUseId,
-                      content   = List(Wire.ToolResultBlock.Json(errJson)),
-                      status    = Some(Wire.ToolResultStatus.Error),
-                    )
-                  },
-                a =>
-                  ZIO.logDebug(s"[Bedrock.loop] dispatch tool=${tu.name} success").as {
-                    val outJson = outSchema.toDynamic(a)
-                    Wire.ToolResultContent(
-                      toolUseId = tu.toolUseId,
-                      content   = List(Wire.ToolResultBlock.Json(outJson)),
-                      status    = Some(Wire.ToolResultStatus.Success),
-                    )
-                  },
-              )
-
-    private def errorResult(toolUseId: ToolUseId, msg: String): Wire.ToolResultContent =
-      Wire.ToolResultContent(
-        toolUseId = toolUseId,
-        content   = List(Wire.ToolResultBlock.Text(msg)),
-        status    = Some(Wire.ToolResultStatus.Error),
-      )
-
   object LoopRequest:
     private[zio_bedrock_converse] inline def fromTools[NT <: NamedTuple.AnyNamedTuple](
       prompt: String,
@@ -1415,13 +967,13 @@ object Bedrock:
       val valuesList = tools.asInstanceOf[Tuple].toList
       val handlers = scala.collection.mutable.Map.empty[
         ToolName,
-        ToolHandler[?, ?, ? <: Matchable, ? <: Matchable],
+        ToolHandler[?, ?, ?, ? <: Matchable],
       ]
       nameList.iterator.zip(valuesList.iterator).foreach: (n, v) =>
         val tn = ToolName(n)
         v match
           case h: ToolHandler[?, ?, ?, ?] =>
-            handlers(tn) = h.asInstanceOf[ToolHandler[?, ?, ? <: Matchable, ? <: Matchable]]
+            handlers(tn) = h.asInstanceOf[ToolHandler[?, ?, ?, ? <: Matchable]]
           case _ => ()  // shouldn't happen — AllTools enforces
       new LoopRequest[NT](
         prompt    = prompt,
@@ -1455,69 +1007,4 @@ object Bedrock:
       LoopRequest.fromTools[NT](prompt, tools)
 
 
-  // ---------- Wire ↔ public translation helpers (private) ----------
-
-  /** Recursively set `additionalProperties: false` on every object
-    * schema. Bedrock rejects structured-output JSON Schema documents
-    * that don't pin this explicitly. */
-  private def withStrictObjects(
-    s: zio.http.endpoint.openapi.JsonSchema,
-  ): zio.http.endpoint.openapi.JsonSchema =
-    import zio.http.endpoint.openapi.JsonSchema as JS
-    s match
-      case o: JS.Object =>
-        o.copy(
-          properties           = o.properties.view.mapValues(withStrictObjects).toMap,
-          additionalProperties = Left(false),
-        )
-      case a: JS.AnnotatedSchema => a.copy(schema = withStrictObjects(a.schema))
-      case a: JS.AllOfSchema     => a.copy(allOf  = a.allOf .map(withStrictObjects))
-      case a: JS.AnyOfSchema     => a.copy(anyOf  = a.anyOf .map(withStrictObjects))
-      case a: JS.OneOfSchema     => a.copy(oneOf  = a.oneOf .map(withStrictObjects))
-      case a: JS.ArrayType       => a.copy(items  = a.items .map(withStrictObjects))
-      case other                  => other
-
-  private def fromWireToolUse(tu: Wire.ToolUseContent): ContentBlock.ToolUse =
-    ContentBlock.ToolUse(
-      toolUseId = tu.toolUseId,
-      name      = tu.name,
-      input     = new ToolInput(tu.input),
-    )
-
-  private def fromWireToolResult(tr: Wire.ToolResultContent): ContentBlock.ToolResult =
-    ContentBlock.ToolResult(
-      toolUseId = tr.toolUseId,
-      content   = tr.content.flatMap:
-        case Wire.ToolResultBlock.Text(t) => List(ToolResultBlock.Text(t))
-        case Wire.ToolResultBlock.Json(j) => List(ToolResultBlock.Json(new ToolInput(j)))
-        case _                            => Nil,  // image/document/video deferred
-      status    = tr.status match
-        case None                                 => null
-        case Some(Wire.ToolResultStatus.Success)  => ToolResultStatus.Success
-        case Some(Wire.ToolResultStatus.Error)    => ToolResultStatus.Error
-      ,
-    )
-
-  /** Convert a public `ContentBlock` into its wire counterpart. Used by
-    * [[internal.Tools.toWire]] when serialising outbound messages. */
-  private[zio_bedrock_converse] def toWireContentBlock(cb: ContentBlock): Wire.ContentBlock =
-    cb match
-      case ContentBlock.Text(t) => Wire.ContentBlock.Text(t)
-      case ContentBlock.ToolUse(id, name, input) =>
-        Wire.ContentBlock.ToolUse(Wire.ToolUseContent(
-          toolUseId = id,
-          name      = name,
-          input     = input.raw,
-        ))
-      case ContentBlock.ToolResult(id, content, status) =>
-        Wire.ContentBlock.ToolResult(Wire.ToolResultContent(
-          toolUseId = id,
-          content   = content.map:
-            case ToolResultBlock.Text(t) => Wire.ToolResultBlock.Text(t)
-            case ToolResultBlock.Json(v) => Wire.ToolResultBlock.Json(v.raw),
-          status    = status match
-            case null                       => None
-            case ToolResultStatus.Success   => Some(Wire.ToolResultStatus.Success)
-            case ToolResultStatus.Error     => Some(Wire.ToolResultStatus.Error)
-          ,
-        ))
+  // (Wire ↔ public translation lives in internal/Helpers.scala)
