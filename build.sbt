@@ -8,6 +8,7 @@ scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
   "-language:strictEquality",
   "-deprecation",
+  "-release", "17",
   // "-Xfatal-warnings", // not sure where it went
 )
 

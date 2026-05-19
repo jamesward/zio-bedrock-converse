@@ -6,6 +6,7 @@ import com.jamesward.zio_bedrock_converse.internal.{Codecs, Wire}
 import zio.*
 import zio.schema.Schema
 import zio.schema.codec.JsonCodec
+import zio.stream.*
 
 import scala.collection.immutable.Queue
 
@@ -45,6 +46,19 @@ object BedrockMock:
           val modelId: ModelId = ModelId("mock")
           def send(req: Wire.ConverseRequest): IO[Error, Wire.ConverseResponse] =
             respond(ref)
+          def sendStream(req: Wire.ConverseRequest): ZStream[Any, Error, String] =
+            ZStream.fromZIO(respond(ref)).map: wire =>
+              wire.output.message.content.collect:
+                case Wire.ContentBlock.Text(t) => t
+              .mkString
+            .flatMap(ZStream.fromIterable(_).map(_.toString))
+          def sendStreamEvents(req: Wire.ConverseRequest): ZStream[Any, Error, Bedrock.StreamEvent] =
+            ZStream.fromZIO(respond(ref)).flatMap: wire =>
+              val textEvents = wire.output.message.content.collect:
+                case Wire.ContentBlock.Text(t) => Bedrock.StreamEvent.TextDelta(t)
+              val stopEvent = Bedrock.StreamEvent.MessageStop(wire.stopReason)
+              val metaEvent = Bedrock.StreamEvent.Metadata(wire.usage, wire.metrics)
+              ZStream.fromIterable(textEvents :+ stopEvent :+ metaEvent)
 
   private def respond(ref: Ref[Queue[MockBehavior]]):
       IO[Error, Wire.ConverseResponse] =

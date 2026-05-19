@@ -439,3 +439,38 @@ object SharedSpec:
   val bedrockLoopIntegrationScenarios: List[BedrockScenario] = List(
     loopIntegrationWeather,
   )
+
+  // ---------- Streaming scenario ----------
+
+  val textStreamScenario: BedrockScenario = new BedrockScenario:
+    val name = "textStream: streams text chunks from the model"
+    val mockScript = List(BedrockMock.MockBehavior.Reply("hello world"))
+    def run =
+      Bedrock.converse("Say hello in one word.").textStream.runCollect.map: chunks =>
+        val joined = chunks.mkString
+        assertTrue(joined.nonEmpty)
+
+  val loopTextStreamScenario: BedrockScenario = new BedrockScenario:
+    val name = "loop textStream: streams final reply after tool dispatch"
+    val mockScript = List(BedrockMock.MockBehavior.Reply("hello world"))
+    def run =
+      val tools = (weather = ToolHandler.fromPure(get_weather, "Get the current weather for a US city."))
+      Bedrock.loop("What is the weather in Denver? Use the weather tool.", tools)
+        .textStream
+        .runCollect
+        .map: chunks =>
+          val joined = chunks.mkString
+          assertTrue(joined.nonEmpty)
+
+  val loopAsStreamScenario: BedrockScenario = new BedrockScenario:
+    val name = "loop asStream: emits tool-use events then text events"
+    val mockScript = List(BedrockMock.MockBehavior.Reply("hello world"))
+    def run =
+      val tools = (weather = ToolHandler.fromPure(get_weather, "Get the current weather for a US city."))
+      Bedrock.loop("What is the weather in Denver? Use the weather tool.", tools)
+        .asStream
+        .runCollect
+        .map: events =>
+          val hasToolStart = events.exists(_.isInstanceOf[Bedrock.StreamEvent.ToolUseStart])
+          val hasText = events.exists(_.isInstanceOf[Bedrock.StreamEvent.TextDelta])
+          assertTrue(hasToolStart, hasText)

@@ -45,51 +45,6 @@ Bedrock.Client.layer(
 )
 ```
 
-## Shape
-
-```scala
-object Bedrock:
-  trait Client                          // service: owns the HTTP wire
-  case class Result[+T](output: T, …)   // wire envelope (stopReason, usage, metrics)
-  sealed trait Error                    // wire / protocol failures
-
-  // ─── low-level: manual tool dispatch ───
-  final class Request                   // pure-data builder; terminals need Client in env
-  case class RequestConfig(...)         // user-facing config (messages, system, …, toolConfig)
-  case class Output(message: Message)   // default `output` shape
-  enum ContentBlock                     // Text | ToolUse | ToolResult
-  case class ToolConfig(tools, toolChoice)
-  enum ToolChoice                       // Auto | Any | Tool(name)
-  final class Tool[I]                   // spec only — name, description, Schema[I]
-  final class ToolInput                 // typed accessor over wire JSON; .as[I: Schema]
-  enum ToolResultBlock                  // Text(String) | Json(ToolInput)
-  enum ToolResultStatus                 // Success | Error
-
-  def converse(cfg: RequestConfig): Request
-  def converse(prompt: String):     Request
-
-  // ─── high-level: handler-bound, exhaustive fold ───
-  final class ToolHandler[-I, -R, +E <: Matchable, +A <: Matchable]
-  sealed trait ModelResponseTool[+A <: Matchable]
-  object ModelResponseTool:
-    case object text                                         // model writes free-form text
-    final class Structured[+A <: Matchable]                  // model writes JSON conforming to Schema[A]
-
-  final class TooledRequest[NT <: NamedTuple.AnyNamedTuple]  // builder, terminal is .fold
-
-  def request[NT](prompt: String, tools: NT): TooledRequest[NT]
-
-  // ─── multi-turn agentic loop ───
-  final class LoopRequest[NT <: NamedTuple.AnyNamedTuple]  // builder; terminals are .text / .as[T] / .asResponse
-
-  def loop[NT](prompt: String, tools: NT): LoopRequest[NT]
-```
-
-`Bedrock.converse(...)` and `Bedrock.request(...)` are both **builders** —
-they return values, not `ZIO`s. The terminals (`Request#text`,
-`Request#asResponse`, `Request#as[T]`, `TooledRequest#fold`) require a
-`Bedrock.Client` in the env and produce `ZIO[Client, …, _]`.
-
 ## Example: plain text
 
 ```scala
@@ -167,33 +122,6 @@ object Tools extends ZIOAppDefault:
       .debug("forecast")
       .provide(Client.default, Bedrock.Client.live, populationServiceLayer)
 ```
-
-What this gets you:
-
-- **No tool boilerplate.** The framework decodes the model's JSON input
-  via `Schema[I]`, runs your handler, and feeds the typed output to the
-  matching `fold` case. You never see `ContentBlock.ToolUse` /
-  `ToolResult` / `ToolInput`.
-- **Exhaustive fold.** The `cases` NamedTuple's keys must match the
-  tools' keys, and each function's parameter type must be the matching
-  tool's typed output. The compiler refuses missing keys, extra keys,
-  or wrong signatures.
-- **Typed error union.** Handler `ZIO.fail(e)` propagates as `e` in the
-  ZIO error channel, alongside `Bedrock.Error`. The signature shows
-  exactly which error types you have to handle (`Bedrock.Error | PopErr`
-  in the example).
-- **`ModelResponseTool` opt-in.** Without one, `toolChoice = Any` forces
-  the model to dispatch a real tool. With `ModelResponseTool.text`, the
-  model can reply with raw text (folded as `String`). With
-  `ModelResponseTool[O]`, the model must produce JSON conforming to
-  `Schema[O]`, which is decoded for you.
-
-Compile-time checks rejected at the `request` call site:
-
-- Empty NamedTuple of tools.
-- A tuple element that isn't a `ToolHandler` or a `ModelResponseTool`.
-- Both `ModelResponseTool.text` *and* `ModelResponseTool[A]` registered
-  (mutually exclusive — the model either writes text or writes JSON).
 
 ## Example: multi-turn agentic loop (`Bedrock.loop`)
 
@@ -348,40 +276,3 @@ A decode failure surfaces as `Bedrock.Error.StructuredDecode(responseText, messa
 `.asResponse[Forecast]` returns the same parsed `Forecast` along with the
 full response envelope (`stopReason`, `usage`, `metrics`). The high-level
 equivalent is registering `ModelResponseTool[Forecast]` with `Bedrock.request`.
-
-## Errors
-
-```scala
-sealed trait Error extends Throwable
-object Error:
-  case class Validation         (message: String)        extends Error  // 400
-  case class AccessDenied       (message: String)        extends Error  // 403
-  case class ResourceNotFound   (message: String)        extends Error  // 404
-  case class ModelTimeout       (message: String)        extends Error  // 408
-  case class ModelErr           (message: String, …)     extends Error  // 424
-  case class Throttling         (message: String)        extends Error  // 429
-  case class InternalServer     (message: String)        extends Error  // 500
-  case class ServiceUnavailable (message: String)        extends Error  // 503
-  case class Unexpected         (status: Status, …)      extends Error
-  case class Transport          (cause: Throwable)       extends Error
-  case class MissingApiKey      ()                       extends Error
-  case class MissingModelId     ()                       extends Error
-  case class StructuredDecode   (responseText: String, …) extends Error
-  /** Model invoked a name not registered with `Bedrock.request`. */
-  case class UnknownTool        (name: ToolName)         extends Error
-  /** Model invoked a registered tool but the input JSON didn't decode. */
-  case class InvalidToolInput   (name: ToolName, …)      extends Error
-  /** Model produced text without a `ModelResponseTool` registered. */
-  case class UnexpectedReply    (description: String)    extends Error
-
-  extension [R, A](zio: ZIO[R, Error, A])
-    /** Retries Throttling / InternalServer / ServiceUnavailable / ModelTimeout. */
-    def retryOnRetryable: ZIO[R, Error, A]
-```
-
-`UnknownTool`, `InvalidToolInput`, and `UnexpectedReply` only fire from
-the high-level `Bedrock.request` flow.
-
-## License
-
-MIT

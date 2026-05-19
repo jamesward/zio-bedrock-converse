@@ -7,6 +7,7 @@ import zio.direct.*
 import zio.http.{Client as HClient, Status}
 import zio.schema.annotation.caseName
 import zio.schema.{DynamicValue, Schema, derived}
+import zio.stream.*
 
 /**
  * Top-level entrypoint for Amazon Bedrock's Converse API.
@@ -215,6 +216,26 @@ object Bedrock:
     def assistant(text: String): Message = Message(Role.Assistant, List(ContentBlock.Text(text)))
 
   /** The user-facing request configuration handed to `Bedrock.converse`. */
+  /** An event from the Bedrock ConverseStream endpoint. Exposed by
+    * `Bedrock.Request#asStream`. */
+  enum StreamEvent:
+    /** The model is producing text — one chunk (typically a few tokens). */
+    case TextDelta(text: String)
+    /** The model is producing reasoning/chain-of-thought content. */
+    case ReasoningDelta(text: String)
+    /** The model is calling a tool — start of a tool-use content block.
+      * The full input JSON arrives incrementally via [[ToolUseDelta]]. */
+    case ToolUseStart(toolUseId: ToolUseId, name: ToolName)
+    /** Incremental JSON fragment of a tool-use input. Buffer until
+      * [[ContentBlockStop]] to get the complete input. */
+    case ToolUseDelta(toolUseId: ToolUseId, inputJson: String)
+    /** A content block (text or tool-use) has completed. */
+    case ContentBlockStop(index: Int)
+    /** The model has finished its turn. */
+    case MessageStop(stopReason: StopReason)
+    /** Usage and latency metadata, emitted after the message completes. */
+    case Metadata(usage: TokenUsage, metrics: Metrics)
+
   case class RequestConfig(
     messages:        List[Message],
     system:          String | Null          = null,
@@ -557,6 +578,13 @@ object Bedrock:
       * `Bedrock.Request` terminals. */
     private[zio_bedrock_converse] def send(req: Wire.ConverseRequest): IO[Error, Wire.ConverseResponse]
 
+    /** Streaming round-trip. Returns a ZStream of text chunks from the
+      * model's response. Uses the `/converse-stream` endpoint. */
+    private[zio_bedrock_converse] def sendStream(req: Wire.ConverseRequest): ZStream[Any, Error, String]
+
+    /** Full event stream. Returns all parsed stream events. */
+    private[zio_bedrock_converse] def sendStreamEvents(req: Wire.ConverseRequest): ZStream[Any, Error, StreamEvent]
+
   object Client:
 
     /** Build a `Client` from an explicit API key, region, and model. */
@@ -593,6 +621,20 @@ object Bedrock:
     /** Final assistant text, joined across the model's last content blocks. */
     def text: ZIO[Client, Error, String] =
       asResponse.map(_.output.text)
+
+    /** Stream text chunks as they arrive from the model. Uses the
+      * `/converse-stream` endpoint. Each element is a text delta
+      * (typically a few tokens). */
+    def textStream: ZStream[Client, Error, String] =
+      ZStream.serviceWithStream[Client]: client =>
+        client.sendStream(Tools.toWire(cfg, outputConfig = None))
+
+    /** Stream the full event stream from the model. Exposes tool-use
+      * starts, text deltas, content-block stops, message stop, and
+      * metadata. Uses the `/converse-stream` endpoint. */
+    def asStream: ZStream[Client, Error, StreamEvent] =
+      ZStream.serviceWithStream[Client]: client =>
+        client.sendStreamEvents(Tools.toWire(cfg, outputConfig = None))
 
     /** Full response, with the assistant turn in `output.message`. */
     def asResponse: ZIO[Client, Error, Result[Output]] =
@@ -975,6 +1017,18 @@ object Bedrock:
     def text: ZIO[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String] =
       asResponse.map(_.output.text).asInstanceOf[ZIO[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String]]
 
+    /** Stream text from the loop. Every turn uses the streaming endpoint.
+      * Tool-dispatch turns are consumed internally (no text emitted);
+      * text deltas from the final reply stream through to the caller. */
+    def textStream: ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String] =
+      runLoopStream(outputConfig = None).asInstanceOf[ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, String]]
+
+    /** Stream all events from every turn, including intermediate tool calls.
+      * Emits `ToolUseStart`, `ToolUseDelta`, `TextDelta`, `ReasoningDelta`,
+      * `ContentBlockStop`, `MessageStop`, and `Metadata` from each iteration. */
+    def asStream: ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent] =
+      runLoopEventStream(outputConfig = None).asInstanceOf[ZStream[Client & EnvOf[NamedTuple.DropNames[NT]], Error, StreamEvent]]
+
     /** Full response envelope after the loop completes. */
     def asResponse: ZIO[Client & EnvOf[NamedTuple.DropNames[NT]], Error, Result[Output]] =
       runLoop(outputConfig = None).map: (wire) =>
@@ -1085,6 +1139,227 @@ object Bedrock:
                 ZIO.succeed(wire)
 
         step(initialMessages, 1)
+
+    /** Streaming loop: every turn uses the streaming endpoint. Tool-use
+      * turns are consumed internally (buffered to extract tool calls,
+      * dispatched, results fed back). Text deltas from non-tool turns
+      * are emitted to the caller. */
+    /** Like runLoopStream but emits ALL StreamEvents (not just text). */
+    private def runLoopEventStream(
+      outputConfig: Option[Wire.OutputConfig],
+    ): ZStream[Client, Error, StreamEvent] =
+      ZStream.unwrap:
+        ZIO.serviceWith[Client]: client =>
+          val wireToolDefs: List[Wire.ToolDef] = handlers.toList.map: (name, h) =>
+            Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
+              name        = name,
+              description = Some(h.description),
+              strict      = None,
+              schema      = h.inputSchema,
+            ))
+          val wireToolConfig: Option[Wire.ToolConfig] =
+            if wireToolDefs.isEmpty then None
+            else Some(Wire.ToolConfig(
+              tools      = wireToolDefs,
+              toolChoice = Some(Wire.ToolChoice.Auto(Wire.EmptyObject())),
+            ))
+          val wireSystem: List[Wire.SystemContentBlock] = systemMsg match
+            case null => Nil
+            case s    => List(Wire.SystemContentBlock.Text(s))
+          val wireInference: Option[InferenceConfig] =
+            if infCfg.asInstanceOf[AnyRef] eq null then None
+            else Some(infCfg.asInstanceOf[InferenceConfig])
+          val initialMessages = List(Wire.WireMessage(
+            role    = Role.User,
+            content = List(Wire.ContentBlock.Text(prompt)),
+          ))
+
+          def streamStep(
+            messages:   List[Wire.WireMessage],
+            iterations: Int,
+          ): ZStream[Any, Error, StreamEvent] =
+            if iterations > maxIter then ZStream.fail(Error.MaxIterations(iterations - 1))
+            else
+              val wireReq = Wire.ConverseRequest(
+                messages        = messages,
+                system          = wireSystem,
+                inferenceConfig = wireInference,
+                toolConfig      = wireToolConfig,
+                outputConfig    = outputConfig,
+              )
+              val eventsStream = client.sendStreamEvents(wireReq)
+
+              ZStream.unwrap:
+                for
+                  toolUsesRef <- Ref.make(List.empty[(ToolUseId, ToolName)])
+                  inputBufRef <- Ref.make(new StringBuilder)
+                  completedRef <- Ref.make(List.empty[Wire.ToolUseContent])
+                yield
+                  // Emit every event AND collect tool-use data
+                  val emitAndCollect = eventsStream.mapZIO: event =>
+                    event match
+                      case Bedrock.StreamEvent.ToolUseStart(id, name) =>
+                        (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
+                          case (tools, buf) =>
+                            val flush = tools.lastOption match
+                              case Some((prevId, prevName)) if buf.nonEmpty =>
+                                import com.jamesward.zio_bedrock_converse.internal.Codecs.given
+                                val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
+                                val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                                  .getOrElse(zio.schema.DynamicValue.NoneValue)
+                                completedRef.update(_ :+ Wire.ToolUseContent(prevId, prevName, input))
+                              case _ => ZIO.unit
+                            flush *> toolUsesRef.set(tools :+ (id, name))
+                        .as(event)
+                      case Bedrock.StreamEvent.ToolUseDelta(_, inputJson) =>
+                        inputBufRef.update(_.append(inputJson)).as(event)
+                      case Bedrock.StreamEvent.ContentBlockStop(_) =>
+                        (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
+                          case (tools, buf) =>
+                            tools.lastOption match
+                              case Some((id, name)) if buf.nonEmpty =>
+                                import com.jamesward.zio_bedrock_converse.internal.Codecs.given
+                                val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
+                                val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                                  .getOrElse(zio.schema.DynamicValue.NoneValue)
+                                completedRef.update(_ :+ Wire.ToolUseContent(id, name, input)) *>
+                                toolUsesRef.update(_.init)
+                              case _ => ZIO.unit
+                        .as(event)
+                      case _ =>
+                        ZIO.succeed(event)
+
+                  // After stream ends, dispatch tools and recurse if needed
+                  emitAndCollect ++ ZStream.unwrap:
+                    completedRef.get.flatMap: toolUses =>
+                      if toolUses.isEmpty then
+                        ZIO.succeed(ZStream.empty)
+                      else
+                        ZIO.logDebug(s"[Bedrock.loop.asStream] iteration=$iterations tool_use=[${toolUses.map(_.name).mkString(", ")}]") *>
+                        ZIO.foreach(toolUses)(dispatchTool).map: results =>
+                          val assistantMsg = Wire.WireMessage(
+                            role    = Role.Assistant,
+                            content = toolUses.map(tu => Wire.ContentBlock.ToolUse(tu)),
+                          )
+                          val toolResultMsg = Wire.WireMessage(
+                            role    = Role.User,
+                            content = results.toList.map(Wire.ContentBlock.ToolResult.apply),
+                          )
+                          streamStep(messages :+ assistantMsg :+ toolResultMsg, iterations + 1)
+
+          streamStep(initialMessages, 1)
+
+    private def runLoopStream(
+      outputConfig: Option[Wire.OutputConfig],
+    ): ZStream[Client, Error, String] =
+      ZStream.unwrap:
+        ZIO.serviceWith[Client]: client =>
+          val wireToolDefs: List[Wire.ToolDef] = handlers.toList.map: (name, h) =>
+            Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
+              name        = name,
+              description = Some(h.description),
+              strict      = None,
+              schema      = h.inputSchema,
+            ))
+          val wireToolConfig: Option[Wire.ToolConfig] =
+            if wireToolDefs.isEmpty then None
+            else Some(Wire.ToolConfig(
+              tools      = wireToolDefs,
+              toolChoice = Some(Wire.ToolChoice.Auto(Wire.EmptyObject())),
+            ))
+          val wireSystem: List[Wire.SystemContentBlock] = systemMsg match
+            case null => Nil
+            case s    => List(Wire.SystemContentBlock.Text(s))
+          val wireInference: Option[InferenceConfig] =
+            if infCfg.asInstanceOf[AnyRef] eq null then None
+            else Some(infCfg.asInstanceOf[InferenceConfig])
+          val initialMessages = List(Wire.WireMessage(
+            role    = Role.User,
+            content = List(Wire.ContentBlock.Text(prompt)),
+          ))
+
+          def streamStep(
+            messages:   List[Wire.WireMessage],
+            iterations: Int,
+          ): ZStream[Any, Error, String] =
+            if iterations > maxIter then ZStream.fail(Error.MaxIterations(iterations - 1))
+            else
+              val wireReq = Wire.ConverseRequest(
+                messages        = messages,
+                system          = wireSystem,
+                inferenceConfig = wireInference,
+                toolConfig      = wireToolConfig,
+                outputConfig    = outputConfig,
+              )
+              // Stream this turn, collect all events to determine if it's a tool call
+              val eventsStream = client.sendStreamEvents(wireReq)
+
+              // We need to both emit text deltas AND detect tool_use.
+              // Strategy: collect all events, emit text deltas as they arrive,
+              // then after the stream ends, check if there were tool calls.
+              // Use a Ref to accumulate tool-use data while streaming.
+              ZStream.unwrap:
+                for
+                  toolUsesRef <- Ref.make(List.empty[(ToolUseId, ToolName)])
+                  inputBufRef <- Ref.make(new StringBuilder)
+                  completedRef <- Ref.make(List.empty[Wire.ToolUseContent])
+                yield
+                  val textAndCollect = eventsStream.mapZIO:
+                    case Bedrock.StreamEvent.TextDelta(text) =>
+                      ZIO.succeed(Some(text))
+                    case Bedrock.StreamEvent.ToolUseStart(id, name) =>
+                      // Flush prior tool's input buffer
+                      (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
+                        case (tools, buf) =>
+                          val flush = tools.lastOption match
+                            case Some((prevId, prevName)) if buf.nonEmpty =>
+                              import com.jamesward.zio_bedrock_converse.internal.Codecs.given
+                              val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
+                              val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                                .getOrElse(zio.schema.DynamicValue.NoneValue)
+                              completedRef.update(_ :+ Wire.ToolUseContent(prevId, prevName, input))
+                            case _ => ZIO.unit
+                          flush *> toolUsesRef.set(tools :+ (id, name))
+                      .as(None)
+                    case Bedrock.StreamEvent.ToolUseDelta(_, inputJson) =>
+                      inputBufRef.update(_.append(inputJson)).as(None)
+                    case Bedrock.StreamEvent.ContentBlockStop(_) =>
+                      // Flush current tool if any
+                      (toolUsesRef.get zip inputBufRef.getAndSet(new StringBuilder)).flatMap:
+                        case (tools, buf) =>
+                          tools.lastOption match
+                            case Some((id, name)) if buf.nonEmpty =>
+                              import com.jamesward.zio_bedrock_converse.internal.Codecs.given
+                              val dynCodec = zio.schema.codec.JsonCodec.schemaBasedBinaryCodec[zio.schema.DynamicValue](Codecs.codecConfig)
+                              val input = dynCodec.decode(Chunk.fromArray(buf.toString.getBytes(java.nio.charset.StandardCharsets.UTF_8)))
+                                .getOrElse(zio.schema.DynamicValue.NoneValue)
+                              completedRef.update(_ :+ Wire.ToolUseContent(id, name, input)) *>
+                              toolUsesRef.update(_.init)
+                            case _ => ZIO.unit
+                      .as(None)
+                    case _ =>
+                      ZIO.succeed(None)
+                  .collect { case Some(text) => text }
+
+                  // After the stream completes, check for tool uses and recurse
+                  textAndCollect ++ ZStream.unwrap:
+                    completedRef.get.flatMap: toolUses =>
+                      if toolUses.isEmpty then
+                        ZIO.succeed(ZStream.empty)
+                      else
+                        ZIO.logDebug(s"[Bedrock.loop.stream] iteration=$iterations tool_use=[${toolUses.map(_.name).mkString(", ")}]") *>
+                        ZIO.foreach(toolUses)(dispatchTool).map: results =>
+                          val assistantMsg = Wire.WireMessage(
+                            role    = Role.Assistant,
+                            content = toolUses.map(tu => Wire.ContentBlock.ToolUse(tu)),
+                          )
+                          val toolResultMsg = Wire.WireMessage(
+                            role    = Role.User,
+                            content = results.toList.map(Wire.ContentBlock.ToolResult.apply),
+                          )
+                          streamStep(messages :+ assistantMsg :+ toolResultMsg, iterations + 1)
+
+          streamStep(initialMessages, 1)
 
     private def dispatchTool(
       tu: Wire.ToolUseContent,

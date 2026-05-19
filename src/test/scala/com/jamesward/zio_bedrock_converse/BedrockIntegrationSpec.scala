@@ -36,7 +36,8 @@ object BedrockIntegrationSpec extends ZIOSpecDefault:
   def spec = suite("Bedrock Integration")(
     (SharedSpec.bedrockScenarios
       ++ SharedSpec.bedrockRequestScenarios
-      ++ SharedSpec.bedrockLoopIntegrationScenarios).map(asTest)*
+      ++ SharedSpec.bedrockLoopIntegrationScenarios
+      ++ List(SharedSpec.textStreamScenario, SharedSpec.loopTextStreamScenario, SharedSpec.loopAsStreamScenario)).map(asTest)*
   ).provideSomeShared[Scope](Client.default, testLayer)
     @@ ifEnvSet("AWS_BEARER_TOKEN_BEDROCK")
     @@ withLiveClock
