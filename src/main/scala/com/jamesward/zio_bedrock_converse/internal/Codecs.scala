@@ -7,9 +7,9 @@ import zio.schema.{DynamicValue, Schema, derived}
 
 /**
  * Codec-level helpers shared by the public data types in
- * [[com.jamesward.zio_bedrock_converse.BedrockConverse]].
+ * [[com.jamesward.zio_bedrock_converse.Bedrock]].
  *
- * Imported into `BedrockConverse.scala` via `import internal.Codecs.given`
+ * Imported into `Bedrock.scala` via `import internal.Codecs.given`
  * so the `derives Schema` macros find `Schema[T | Null]` and
  * `Schema[Nothing]` instances at use sites.
  */

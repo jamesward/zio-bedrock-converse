@@ -1,10 +1,10 @@
 package com.jamesward.zio_bedrock_converse.internal
 
-import com.jamesward.zio_bedrock_converse.BedrockConverse.*
+import com.jamesward.zio_bedrock_converse.Bedrock.*
 import com.jamesward.zio_bedrock_converse.internal.Codecs.{given, *}
 import zio.http.endpoint.openapi.JsonSchema
 import zio.schema.annotation.{caseName, discriminatorName, noDiscriminator}
-import zio.schema.{Schema, derived}
+import zio.schema.{DynamicValue, Schema, derived}
 
 import java.util.Base64
 
@@ -12,7 +12,7 @@ import java.util.Base64
  * Wire-format types for the Bedrock Converse API.
  *
  * These case classes / enums mirror the JSON shapes AWS speaks. The public
- * `BedrockConverse` API translates user-facing types into these wire shapes
+ * `Bedrock` API translates user-facing types into these wire shapes
  * only when an HTTP request is being built.
  *
  * Wire types use `Option[T] = None` for optional fields because Schema
@@ -69,27 +69,29 @@ private[zio_bedrock_converse] object Wire:
 
   // ---------- Tool-use / tool-result payloads ----------
 
-  case class ToolUseContent[+T](
+  case class ToolUseContent(
     toolUseId: ToolUseId,
     name:      ToolName,
-    input:     T,
+    input:     DynamicValue,
   ) derives Schema
 
   enum ToolResultStatus derives Schema:
     @caseName("success") case Success
     @caseName("error")   case Error
 
+  given CanEqual[ToolResultStatus, ToolResultStatus] = CanEqual.derived
+
   @noDiscriminator
-  enum ToolResultBlock[+T] derives Schema:
+  enum ToolResultBlock derives Schema:
     case Text(text: String)
-    case Json(json: T)
+    case Json(json: DynamicValue)
     case Image(image: ImageContent)
     case Document(document: DocumentContent)
     case Video(video: VideoContent)
 
-  case class ToolResultContent[+T](
+  case class ToolResultContent(
     toolUseId: ToolUseId,
-    content:   List[ToolResultBlock[T]],
+    content:   List[ToolResultBlock],
     status:    Option[ToolResultStatus] = None,
   ) derives Schema
 
@@ -109,13 +111,13 @@ private[zio_bedrock_converse] object Wire:
   ) derives Schema
 
   @noDiscriminator
-  enum ContentBlock[+T] derives Schema:
+  enum ContentBlock derives Schema:
     case Text(text: String)
     case Image(image: ImageContent)
     case Document(document: DocumentContent)
     case Video(video: VideoContent)
-    case ToolUse(toolUse: ToolUseContent[T])
-    case ToolResult(toolResult: ToolResultContent[T])
+    case ToolUse(toolUse: ToolUseContent)
+    case ToolResult(toolResult: ToolResultContent)
     case CachePoint(cachePoint: CachePointContent)
     case ReasoningContent(reasoningContent: ReasoningContentBlock)
 
@@ -124,7 +126,7 @@ private[zio_bedrock_converse] object Wire:
     case Text(text: String)
     case CachePoint(cachePoint: CachePointContent)
 
-  case class WireMessage[+T](role: Role, content: List[ContentBlock[T]]) derives Schema
+  case class WireMessage(role: Role, content: List[ContentBlock]) derives Schema
 
   // ---------- Tool config (request side) ----------
 
@@ -206,8 +208,8 @@ private[zio_bedrock_converse] object Wire:
 
   // ---------- Wire request / response ----------
 
-  case class ConverseRequest[T](
-    messages:        List[WireMessage[T]],
+  case class ConverseRequest(
+    messages:        List[WireMessage],
     system:          List[SystemContentBlock]   = Nil,
     inferenceConfig: Option[InferenceConfig]    = None,
     toolConfig:      Option[ToolConfig]         = None,
@@ -216,11 +218,11 @@ private[zio_bedrock_converse] object Wire:
     additionalModelResponseFieldPaths: List[String] = Nil,
   ) derives Schema
 
-  case class ConverseOutput[T](message: WireMessage[T]) derives Schema
+  case class ConverseOutput(message: WireMessage) derives Schema
 
-  case class ConverseResponse[T](
-    output:     ConverseOutput[T],
+  case class ConverseResponse(
+    output:     ConverseOutput,
     stopReason: StopReason,
     usage:      TokenUsage,
-    metrics:    ConverseMetrics,
+    metrics:    Metrics,
   ) derives Schema

@@ -1,48 +1,41 @@
 package com.jamesward.zio_bedrock_converse.internal
 
-import com.jamesward.zio_bedrock_converse.BedrockConverse.{Tool, ToolName}
-import zio.ZIO
+import com.jamesward.zio_bedrock_converse.Bedrock.{Tool, ToolName}
 import zio.schema.Schema
 
 import scala.quoted.*
 
 /**
- * Compile-time helpers behind the `.asTool` extension methods. Each
- * builds a [[Tool]] whose name is derived from the function reference
- * passed at the call site.
+ * Compile-time helper behind the `.asTool` extension method.
  *
- * Recognised function shapes for name extraction:
+ * The handler-bearing `Tool` has been split out (Option β) — `Tool[I]`
+ * now carries only the spec (name, description, `Schema[I]`). The macro
+ * therefore discards the function body and keeps only its name.
+ *
+ * The tool name is derived from the function reference passed at the
+ * call site. Recognised shapes:
  *  - bare reference:           `getWeather`            (eta-expanded)
  *  - explicit eta-expansion:   `getWeather _`
  *  - lambda calling a method:  `(x: I) => getWeather(x)`
  *
- * For anonymous closures with no obvious method name the macro aborts
- * at compile time — callers should pass an explicit `ToolName` via
- * the regular `Tool` constructors instead.
+ * For anonymous closures with no obvious method name the macro aborts at
+ * compile time — callers should pass an explicit `ToolName` via the
+ * `Tool.apply` constructor instead.
  */
 private[zio_bedrock_converse] object ToolMacros:
 
-  def asToolPure[I: Type, O: Type](
-    f:           Expr[I => O],
+  def asTool[I: Type](
+    f:           Expr[Any],
     description: Expr[String],
-    schemaI:     Expr[Schema[I]],
-    schemaO:     Expr[Schema[O]],
-  )(using Quotes): Expr[Tool[I, O, Any, Nothing]] =
-    val name = extractName(f)
-    '{
-      Tool.makePure[I, O](ToolName($name), $description, $f)(using $schemaI, $schemaO)
-    }
+  )(using Quotes): Expr[Tool[I]] =
+    val name    = extractName(f)
+    val schemaI = summonSchema[I]
+    '{ Tool[I](ToolName($name), $description)(using $schemaI) }
 
-  def asToolZIO[I: Type, O: Type, R: Type, E: Type](
-    f:           Expr[I => ZIO[R, E, O]],
-    description: Expr[String],
-    schemaI:     Expr[Schema[I]],
-    schemaO:     Expr[Schema[O]],
-  )(using Quotes): Expr[Tool[I, O, R, E]] =
-    val name = extractName(f)
-    '{
-      Tool.makeZIO[I, O, R, E](ToolName($name), $description, $f)(using $schemaI, $schemaO)
-    }
+  private def summonSchema[T: Type](using Quotes): Expr[Schema[T]] =
+    import quotes.reflect.*
+    Expr.summon[Schema[T]].getOrElse:
+      report.errorAndAbort(s"No `Schema[${Type.show[T]}]` in scope for `.asTool`.")
 
   private def extractName(f: Expr[Any])(using Quotes): Expr[String] =
     import quotes.reflect.*
@@ -67,5 +60,5 @@ private[zio_bedrock_converse] object ToolMacros:
     go(f.asTerm) match
       case Some(name) => Expr(name)
       case None       => report.errorAndAbort(
-        s"asTool: could not derive a tool name from the function — use the explicit-name constructor instead. (term: ${f.asTerm.show})"
+        s"asTool: could not derive a tool name from the function — use `Tool(ToolName(\"…\"), \"…\")` directly. (term: ${f.asTerm.show})"
       )
