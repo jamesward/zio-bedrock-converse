@@ -1,5 +1,7 @@
 # zio-bedrock-converse
 
+[![javadocs.dev](https://www.javadocs.dev/com.jamesward/zio-bedrock-converse_3/badge.svg)](https://www.javadocs.dev/com.jamesward/zio-bedrock-converse_3/latest)
+
 A Scala 3 / ZIO library for Amazon Bedrock's [Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html),
 authenticated with Bedrock [API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) (bearer tokens — no SigV4).
 
@@ -50,126 +52,89 @@ Bedrock.Client.layer(
 )
 ```
 
+## Basic inference (`Bedrock.converse`)
 
-## Example: plain text
+Five terminals, one prompt each. Every example below assumes
+`Client.default` and `Bedrock.Client.live` in scope.
 
 ```scala
-import com.jamesward.zio_bedrock_converse.Bedrock
-import com.jamesward.zio_bedrock_converse.Bedrock.*
-import zio.*
-import zio.http.Client
+case class Food(name: String, region: String) derives Schema
 
-object Hello extends ZIOAppDefault:
-  def run =
-    Bedrock.converse(RequestConfig(
-      messages        = List(Message.user("Give me a one-sentence summary of the Converse API.")),
-      system          = "You are concise.",
-      inferenceConfig = InferenceConfig(maxTokens = 200, temperature = 0.3),
-    ))
-    .text
-    .debug("answer")
-    .provide(Client.default, Bedrock.Client.live)
+// Plain text.
+Bedrock.converse("say hello").text
+
+// Structured output: the model is told to produce JSON conforming to
+// Schema[Food], and the text reply is decoded into a Food.
+Bedrock.converse("Favorite food").as[Food]
+
+// Full envelope: stopReason, usage, metrics, plus the assistant message.
+Bedrock.converse("tell a one-line joke").asResponse
+
+// Structured output + envelope.
+Bedrock.converse("Worst food").asResponse[Food]
+
+// Streaming: each emitted String is a text delta from the model.
+Bedrock.converse("Write a poem about Scala").textStream
+  .runForeach(Console.print(_).orDie)
 ```
 
-`RequestConfig.apply(prompt: String)` is a single-message convenience —
+
+`RequestConfig(prompt: String)` is a single-message convenience —
 `Bedrock.converse("hi")` is just `Bedrock.converse(RequestConfig("hi"))`.
+For full control over messages, system prompt, and inference config,
+pass a `RequestConfig` directly.
 
-## Example: high-level tools (`Bedrock.request`)
+A structured-output decode failure surfaces as
+`Bedrock.Error.StructuredDecode(responseText, message)`.
 
-The high-level API takes a `NamedTuple` of registered tools — handlers
-that the framework dispatches automatically, plus an optional
-`ModelResponseTool` if you want the model to be able to reply with text
-or structured JSON. The terminal `.fold` is exhaustive: every key in the
-NamedTuple gets a function from its tool's typed output to a unified
-result `R`.
+## Defining tools
+
+Tool handlers are bundled in a `NamedTuple`. The key becomes the tool
+name advertised to the model; input/output/error types must have
+`Schema` instances.
 
 ```scala
-import com.jamesward.zio_bedrock_converse.Bedrock
-import com.jamesward.zio_bedrock_converse.Bedrock.*
-import zio.*
-import zio.http.Client
-import zio.schema.{Schema, derived}
-
-case class WeatherInput(city: String) derives Schema
-case class WeatherOutput(temperatureF: Int, conditions: String) derives Schema
-case class PopulationInput(city: String) derives Schema
-case class PopErr(message: String) derives Schema             // typed errors need Schema
-case class Forecast(city: String, summary: String) derives Schema
-
-trait PopulationService:
-  def populationOf(city: String): IO[PopErr, Int]
-
-def get_weather(in: WeatherInput): WeatherOutput =
-  WeatherOutput(64, "foggy")
-
-def get_population(in: PopulationInput): ZIO[PopulationService, PopErr, Int] =
-  ZIO.serviceWithZIO[PopulationService](_.populationOf(in.city))
-
-object Tools extends ZIOAppDefault:
-  def run =
-    val tools = (
-      weather    = get_weather.asHandler("Get the current weather for a US city."),
-      population = get_population.asHandler("Get the population of a city."),
-      reply      = ModelResponseTool[Forecast]("Summarise the answer as a Forecast."),
-    )
-
-    val program: ZIO[
-      Bedrock.Client & PopulationService,
-      Bedrock.Error | PopErr,
-      Bedrock.Result[Forecast],
-    ] =
-      Bedrock.request("Weather and population of Denver?", tools).fold[Forecast]:
-        (weather    = (w: WeatherOutput) => Forecast("Denver", s"${w.temperatureF}°F"),
-         population = (p: Int)           => Forecast("Denver", s"$p people"),
-         reply      = (f: Forecast)      => f)
-
-    program
-      .map(_.output)
-      .debug("forecast")
-      .provide(Client.default, Bedrock.Client.live, populationServiceLayer)
+val tools = (
+  // Effectful: ZIO[R, E, A]. Schema[E] is required so loop can wire-encode
+  // failures back to the model.
+  randomLetters = ToolHandler(
+    (n: Int) => Random.nextIntBounded(26).replicateZIO(n)
+      .map(_.map(i => ('a' + i).toChar).mkString),
+    "generate n random letters",
+  ),
+  // Pure: I => A. No environment, no errors.
+  reverse = ToolHandler.fromPure(
+    (s: String) => s.reverse,
+    "reverse a string",
+  ),
+)
 ```
 
-## Example: multi-turn agentic loop (`Bedrock.loop`)
+The same `tools` NamedTuple drives both `Bedrock.loop` and
+`Bedrock.request`.
 
-Same handler NamedTuple as `Bedrock.request`, but the framework drives
-the loop: dispatches tools, feeds results back to the model, repeats
-until the model produces a final reply or `maxIterations` is hit.
+For input/output classes you can `derives Schema` and field
+descriptions propagate to the JSON Schema sent to the model.
 
-Handler errors are encoded via `Schema[E]` and fed back to the model as
-`tool_result.status = Error` — the model can self-correct. They never
-surface in the ZIO error channel.
+## Multi-turn agentic loop (`Bedrock.loop`)
+
+The framework dispatches tools and feeds results back to the model
+until the model produces a final reply (or `maxIterations` is hit,
+default 10). Handler errors are encoded via `Schema[E]` and fed back
+to the model as `tool_result.status = Error` — they don't surface in
+the ZIO error channel.
 
 ```scala
-import com.jamesward.zio_bedrock_converse.Bedrock
-import com.jamesward.zio_bedrock_converse.Bedrock.*
-import zio.*
-import zio.http.Client
-import zio.schema.{Schema, derived}
+// Final text reply.
+Bedrock.loop("generate 8 random letters", tools).text
 
-case class WeatherInput(city: String) derives Schema
-case class WeatherOutput(temperatureF: Int, conditions: String) derives Schema
-case class Forecast(city: String, summary: String) derives Schema
+// Final reply parsed as Food.
+Bedrock.loop("generate 8 random letters; suggest a similar food name", tools)
+  .as[Food]
 
-def get_weather(in: WeatherInput): WeatherOutput =
-  WeatherOutput(64, "foggy")
-
-object AgentLoop extends ZIOAppDefault:
-  def run =
-    val tools = (
-      weather = ToolHandler.fromPure(get_weather, "Get the current weather for a US city."),
-    )
-
-    // Text reply
-    Bedrock.loop("What is the weather in Denver?", tools)
-      .text
-      .debug("answer")
-      .provide(Client.default, Bedrock.Client.live)
-
-    // Or structured reply
-    Bedrock.loop("Weather of Denver? Respond as a Forecast.", tools)
-      .as[Forecast]
-      .debug("forecast")
-      .provide(Client.default, Bedrock.Client.live)
+// Multiple tool calls per loop, streaming the final reply's text.
+Bedrock.loop("display 8 random letters and its reverse", tools)
+  .textStream.runForeach(Console.print(_).orDie)
 ```
 
 Configuration:
@@ -178,14 +143,54 @@ Configuration:
 Bedrock.loop("…", tools)
   .system("You are concise.")
   .inferenceConfig(InferenceConfig(maxTokens = 500))
-  .maxIterations(5)    // default is 10
+  .maxIterations(5)
   .text
 ```
 
 Debug logging is built in at `ZIO.logDebug` level — set your ZIO log
 level to `DEBUG` to see each iteration's tool dispatches and replies.
 
-## Example: low-level tools (`Bedrock.converse`)
+## Single-turn with tools (`Bedrock.request`)
+
+Same `tools` NamedTuple, but the framework runs the tool exactly once
+and hands the typed output to a `.fold` whose keys mirror the tool
+keys. Use this when you want the model's tool call to be the answer
+(no follow-up turn).
+
+```scala
+Bedrock.request("generate a 16 character random string", tools).fold[Unit]:
+  (
+    randomLetters = s => println(s"tool result: $s"),
+    reverse       = s => println("should not happen"),
+  )
+```
+
+The `.fold` is exhaustive: every key in `tools` needs a function from
+its tool's typed output to a unified result type. Tool failures
+propagate through the ZIO error channel as a typed union of every
+handler's `E`.
+
+To let the model reply with text or structured JSON instead of
+dispatching a tool, register a `ModelResponseTool` in the NamedTuple:
+
+```scala
+case class Forecast(city: String, summary: String) derives Schema
+
+val tools = (
+  randomLetters = ToolHandler(…),
+  reverse       = ToolHandler.fromPure(…),
+  reply         = ModelResponseTool[Forecast]("Summarise the answer."),
+)
+
+Bedrock.request("…", tools).fold[Forecast]:
+  (
+    randomLetters = s => Forecast("?", s),
+    reverse       = s => Forecast("?", s),
+    reply         = f => f,
+  )
+```
+
+## Low-level tools (`Bedrock.converse`)
 
 When you want full control — drive the round-trip yourself, decide on
 the fly whether to send the result back, build custom message
@@ -240,45 +245,3 @@ object Weather extends ZIOAppDefault:
 
     program.debug("answer").provide(Client.default, Bedrock.Client.live)
 ```
-
-What the macros / typed accessors give you:
-- `get_weather.asTool("…")` derives `ToolName("get_weather")` at compile
-  time from the function reference and captures `Schema[WeatherInput]`.
-- `input.as[WeatherInput]` decodes the model's JSON input through
-  `Schema[WeatherInput]` — `DynamicValue` never enters the public API.
-- `ToolResultBlock.json(answer)` encodes the typed answer through
-  `Schema[WeatherOutput]`.
-
-## Example: structured output (low-level)
-
-Ask the model to produce JSON conforming to a `Schema[T]` and get a `T`
-back, parsed for you.
-
-```scala
-import com.jamesward.zio_bedrock_converse.Bedrock
-import com.jamesward.zio_bedrock_converse.Bedrock.*
-import zio.*
-import zio.http.Client
-import zio.schema.{Schema, derived}
-
-case class Forecast(city: String, summary: String) derives Schema
-
-object StructuredForecast extends ZIOAppDefault:
-  def run =
-    Bedrock
-      .converse("Give a one-sentence weather forecast for Seattle. Fill in city and summary.")
-      .as[Forecast]
-      .debug("forecast")
-      .provide(Client.default, Bedrock.Client.live)
-```
-
-What happens behind the scenes:
-1. `Schema[Forecast]` is converted to a JSON Schema document.
-2. The request's `outputConfig.textFormat = { type: "json_schema", … }` is set.
-3. The model's text response is parsed back through `Schema[Forecast]` into a `Forecast`.
-
-A decode failure surfaces as `Bedrock.Error.StructuredDecode(responseText, message)`.
-
-`.asResponse[Forecast]` returns the same parsed `Forecast` along with the
-full response envelope (`stopReason`, `usage`, `metrics`). The high-level
-equivalent is registering `ModelResponseTool[Forecast]` with `Bedrock.request`.
