@@ -2,7 +2,7 @@ organization := "com.jamesward"
 
 name := "zio-bedrock-converse"
 
-scalaVersion := "3.8.4"
+scalaVersion := "3.9.0"
 
 scalacOptions ++= Seq(
   // "-Yexplicit-nulls", // not sure where it went
