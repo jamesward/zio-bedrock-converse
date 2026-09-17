@@ -9,6 +9,89 @@ import zio.stream.*
 
 private[zio_bedrock_converse] object LoopImpl:
 
+
+  def runDynamicLoop[R, E](
+    prompt: String,
+    tools: List[Tool[?]],
+    handler: (ToolName, ToolInput) => ZIO[R, E, DynamicToolResult],
+    systemMessage: String | Null,
+    inferenceConfig: InferenceConfig | Null,
+    maxTurns: Int,
+  ): ZIO[Client & R, Error | E, DynamicLoopResult[Output]] =
+    def optionalInt(value: Int | Null): Option[Int] =
+      if value.asInstanceOf[AnyRef] eq null then None else Some(value.asInstanceOf[Int])
+
+    def totals(turns: List[LoopTurn]): LoopTotals =
+      val usages = turns.map(_.usage)
+      val cacheReads = usages.flatMap(usage => optionalInt(usage.cacheReadInputTokens))
+      val cacheWrites = usages.flatMap(usage => optionalInt(usage.cacheWriteInputTokens))
+      LoopTotals(
+        TokenUsage(
+          inputTokens = usages.map(_.inputTokens).sum,
+          outputTokens = usages.map(_.outputTokens).sum,
+          totalTokens = usages.map(_.totalTokens).sum,
+          cacheReadInputTokens = if cacheReads.isEmpty then null else cacheReads.sum,
+          cacheWriteInputTokens = if cacheWrites.isEmpty then null else cacheWrites.sum,
+        ),
+        latencyMs = turns.map(_.metrics.latencyMs).sum,
+      )
+
+    val initial = Tools.toWire(
+      RequestConfig(
+        messages = List(Message.user(prompt)),
+        system = systemMessage,
+        inferenceConfig = inferenceConfig,
+        toolConfig = ToolConfig(tools),
+      ),
+      outputConfig = None,
+    )
+
+    ZIO.serviceWithZIO[Client]: client =>
+      def step(
+        messages: List[Wire.WireMessage],
+        turn: Int,
+        previousTurns: List[LoopTurn],
+      ): ZIO[R, Error | E, DynamicLoopResult[Output]] =
+        if turn > maxTurns then ZIO.fail(Error.MaxIterations(maxTurns))
+        else
+          client.send(initial.copy(messages = messages)).flatMap: response =>
+            val toolUses = response.output.message.content.collect:
+              case Wire.ContentBlock.ToolUse(value) => value
+            val current = LoopTurn(
+              turn,
+              response.stopReason,
+              response.usage,
+              response.metrics,
+              toolUses.map(_.name),
+            )
+            val allTurns = previousTurns :+ current
+            ZIO.logDebug(
+              s"[Bedrock.dynamicLoop] turn=$turn stop=${response.stopReason} tools=[${current.toolNames.map(ToolName.unwrap).mkString(", ")}]"
+            ) *>
+              (if toolUses.isEmpty then
+                 val publicContent = response.output.message.content.collect:
+                   case Wire.ContentBlock.Text(text)       => ContentBlock.Text(text)
+                   case Wire.ContentBlock.ToolUse(value)   => Helpers.fromWireToolUse(value)
+                   case Wire.ContentBlock.ToolResult(value) => Helpers.fromWireToolResult(value)
+                 ZIO.succeed(DynamicLoopResult(
+                   Output(Message(response.output.message.role, publicContent)),
+                   response.stopReason,
+                   allTurns,
+                   totals(allTurns),
+                 ))
+               else
+                 ZIO.foreach(toolUses) { toolUse =>
+                   handler(toolUse.name, new ToolInput(toolUse.input)).map: result =>
+                     Helpers.toWireContentBlock(ContentBlock.ToolResult(
+                       toolUse.toolUseId,
+                       result.content,
+                       result.status,
+                     ))
+                 }.flatMap: results =>
+                   val resultMessage = Wire.WireMessage(Role.User, results)
+                   step(messages :+ response.output.message :+ resultMessage, turn + 1, allTurns))
+
+      step(initial.messages, turn = 1, previousTurns = Nil)
   def runLoop(
     lr:           LoopRequest[?],
     outputConfig: Option[Wire.OutputConfig],

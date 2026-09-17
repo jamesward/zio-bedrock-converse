@@ -1,8 +1,9 @@
 package com.jamesward.zio_bedrock_converse.internal
 
-import zio.http.endpoint.openapi.JsonSchema
+import zio.json.ast.Json
 import zio.schema.annotation.directDynamicMapping
 import zio.schema.codec.JsonCodec
+import zio.schema.codec.json.schemaJson
 import zio.schema.{DynamicValue, Schema, derived}
 
 /**
@@ -53,6 +54,6 @@ private[zio_bedrock_converse] object Codecs:
     )
 
   /** Wire envelope for the `inputSchema.json` slot in Bedrock's tool
-    * configuration. Stays internal — users build a `ToolSpecData[I]` from a
-    * `Schema[I]` and never construct this themselves. */
-  case class InputSchema(json: JsonSchema) derives Schema
+    * configuration. JSON AST uses direct dynamic mapping, preserving runtime
+    * schemas exactly. */
+  case class InputSchema(json: Json) derives Schema

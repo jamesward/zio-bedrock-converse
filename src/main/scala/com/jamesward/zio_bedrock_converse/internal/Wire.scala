@@ -4,6 +4,8 @@ import com.jamesward.zio_bedrock_converse.Bedrock.*
 import com.jamesward.zio_bedrock_converse.internal.Codecs.{given, *}
 import zio.Chunk
 import zio.http.endpoint.openapi.JsonSchema
+import zio.json.*
+import zio.json.ast.Json
 import zio.schema.annotation.{caseName, discriminatorName, noDiscriminator}
 import zio.schema.{DynamicValue, Schema, derived}
 
@@ -27,13 +29,18 @@ private[zio_bedrock_converse] object Wire:
     * schema is a primitive/array, wrap it in an object with a single
     * "value" property. */
   private def ensureObjectSchema(js: JsonSchema): JsonSchema =
-    js match
-      case _: JsonSchema.Object => js
-      case _ => JsonSchema.Object(
-        properties           = Map("value" -> js),
-        additionalProperties = Left(false),
-        required             = Chunk("value"),
-      )
+    if js.withoutAnnotations.isInstanceOf[JsonSchema.Object] then js
+    else JsonSchema.Object(
+      properties           = Map("value" -> js),
+      additionalProperties = Left(false),
+      required             = Chunk("value"),
+    )
+
+  private def toJsonAst(schema: JsonSchema): Json =
+    schema.toJson.fromJson[Json].fold(
+      error => throw new IllegalArgumentException(s"Could not encode generated JSON Schema: $error"),
+      identity,
+    )
 
   // ---------- Media / content blocks ----------
 
@@ -147,17 +154,28 @@ private[zio_bedrock_converse] object Wire:
     val name:        ToolName,
     val description: Option[String],
     val strict:      Option[Boolean],
-    private[zio_bedrock_converse] val schemaI: Schema[?],
+    private[zio_bedrock_converse] val schemaSource: ToolSpecData.SchemaSource,
   ):
     override def toString: String = s"ToolSpecData($name, $description, $strict)"
 
   object ToolSpecData:
+    private[zio_bedrock_converse] enum SchemaSource:
+      case Typed(value: Schema[?])
+      case Dynamic(value: Json.Obj)
+
     def apply(
       name:        ToolName,
       description: Option[String],
       strict:      Option[Boolean],
       schema:      Schema[?],
-    ): ToolSpecData = new ToolSpecData(name, description, strict, schema)
+    ): ToolSpecData = new ToolSpecData(name, description, strict, SchemaSource.Typed(schema))
+
+    def dynamic(
+      name:        ToolName,
+      description: Option[String],
+      strict:      Option[Boolean],
+      schema:      Json.Obj,
+    ): ToolSpecData = new ToolSpecData(name, description, strict, SchemaSource.Dynamic(schema))
 
     private case class Wire(
       name:        ToolName,
@@ -168,16 +186,21 @@ private[zio_bedrock_converse] object Wire:
 
     given Schema[ToolSpecData] =
       summon[Schema[Wire]].transform[ToolSpecData](
-        w => new ToolSpecData(w.name, w.description, w.strict, Schema[Unit]),
-        t => Wire(
-          name        = t.name,
-          description = t.description,
-          inputSchema = InputSchema(ensureObjectSchema(JsonSchema.fromZSchema(
-            t.schemaI,
-            JsonSchema.SchemaRef(JsonSchema.SchemaSpec.JsonSchema, JsonSchema.SchemaStyle.Inline),
-          ))),
-          strict      = t.strict,
-        ),
+        w => new ToolSpecData(w.name, w.description, w.strict, SchemaSource.Typed(Schema[Unit])),
+        t =>
+          val schema = t.schemaSource match
+            case SchemaSource.Typed(value) =>
+              toJsonAst(ensureObjectSchema(JsonSchema.fromZSchema(
+                value,
+                JsonSchema.SchemaRef(JsonSchema.SchemaSpec.JsonSchema, JsonSchema.SchemaStyle.Inline),
+              )))
+            case SchemaSource.Dynamic(value) => value
+          Wire(
+            name        = t.name,
+            description = t.description,
+            inputSchema = InputSchema(schema),
+            strict      = t.strict,
+          ),
       )
 
   @noDiscriminator

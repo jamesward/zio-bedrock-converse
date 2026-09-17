@@ -14,12 +14,12 @@ scalacOptions ++= Seq(
 
 val zioVersion = "2.1.26"
 
-val zioSchemaVersion = "1.8.5"
+val zioSchemaVersion = "1.9.0"
 
 libraryDependencies ++= Seq(
   "dev.zio" %% "zio"                    % zioVersion,
   "dev.zio" %% "zio-direct"             % "1.0.0-RC7",
-  "dev.zio" %% "zio-http"               % "3.11.5",
+  "dev.zio" %% "zio-http"               % "3.11.6",
   "dev.zio" %% "zio-schema-derivation"  % zioSchemaVersion,
   "dev.zio" %% "zio-schema-json"        % zioSchemaVersion,
 
@@ -38,16 +38,16 @@ javaOptions ++= Seq(
   "--sun-misc-unsafe-memory-access=allow",
 )
 
-licenses := Seq("MIT License" -> url("https://opensource.org/licenses/MIT"))
+licenses := Seq("Apache 2.0" -> uri("https://opensource.org/licenses/apache-2.0"))
 
-homepage := Some(url("https://github.com/jamesward/zio-bedrock-converse"))
+homepage := Some(uri("https://github.com/jamesward/zio-bedrock-converse"))
 
 developers := List(
   Developer(
     "jamesward",
     "James Ward",
     "james@jamesward.com",
-    url("https://jamesward.com")
+    uri("https://jamesward.com")
   )
 )
 

@@ -5,18 +5,21 @@
 A Scala 3 / ZIO library for Amazon Bedrock's [Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html),
 authenticated with Bedrock [API keys](https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html) (bearer tokens — no SigV4).
 
-- Typed end-to-end. No `DynamicValue` in the public API.
-- Tool input / output / error JSON Schemas derive from `zio.schema.Schema`.
+- Typed tool APIs derive input / output / error JSON Schemas from
+  `zio.schema.Schema`; runtime catalogs can supply JSON Schema objects
+  directly with `Tool.dynamic`.
 - Built on ZIO HTTP's `Client`.
-- Three APIs:
+- Four APIs:
   - **`Bedrock.converse`** — low-level. You drive the wire, including
     manual tool dispatch.
-  - **`Bedrock.request`** — high-level single-turn. Bundle handlers in a
-    NamedTuple, fold over the typed outcome. Tool errors flow through
+  - **`Bedrock.request`** — high-level single-turn. Bundle typed handlers in a
+    NamedTuple, then fold over the typed outcome. Tool errors flow through
     ZIO's error channel as a typed union.
-  - **`Bedrock.loop`** — multi-turn agentic. Same handler NamedTuple,
-    but the framework dispatches tools and feeds results back
-    automatically. Terminals (`.text`, `.as[T]`) mirror `Bedrock.converse`.
+  - **`Bedrock.loop`** — typed multi-turn agentic loop. The framework dispatches
+    a handler NamedTuple and feeds results back automatically.
+  - **`Bedrock.dynamicLoop`** — runtime multi-turn loop. Supply tools discovered
+    at runtime plus one generic handler; the library owns complete Converse
+    history and returns per-turn and aggregate usage/latency metrics.
 
 ## Install
 
@@ -87,7 +90,7 @@ pass a `RequestConfig` directly.
 A structured-output decode failure surfaces as
 `Bedrock.Error.StructuredDecode(responseText, message)`.
 
-## Defining tools
+## Defining typed tools
 
 Tool handlers are bundled in a `NamedTuple`. The key becomes the tool
 name advertised to the model; input/output/error types must have
@@ -149,6 +152,80 @@ Bedrock.loop("…", tools)
 
 Debug logging is built in at `ZIO.logDebug` level — set your ZIO log
 level to `DEBUG` to see each iteration's tool dispatches and replies.
+
+## Runtime tools and metrics (`Bedrock.dynamicLoop`)
+
+Use `dynamicLoop` when tool names and input schemas are discovered at
+runtime rather than represented by a compile-time NamedTuple. A
+`Tool.dynamic` carries its `zio.json.ast.Json.Obj` input schema verbatim;
+`ToolInput.asJsonObject` exposes the model-generated arguments without a
+Scala input class.
+
+The following adapter uses
+[`zio-http-mcp`](https://github.com/jamesward/zio-http-mcp). It has no
+hard-coded tool names or schemas: every tool comes from MCP `tools/list`,
+and one generic handler dispatches every call.
+
+```scala
+import com.jamesward.zio_bedrock_converse.Bedrock
+import com.jamesward.zio_bedrock_converse.Bedrock.*
+import com.jamesward.ziohttp.mcp.client.McpClient
+import zio.*
+import zio.json.*
+
+// Requires "com.jamesward" %% "zio-http-mcp" % "<version>".
+def runWithMcp(mcp: McpClient): ZIO[Bedrock.Client, Throwable, DynamicLoopResult[String]] =
+  for
+    definitions <- mcp.listTools
+    tools = definitions.toList.map: definition =>
+      Tool.dynamic(
+        ToolName(definition.name.value),
+        definition.description.getOrElse(definition.name.value),
+        definition.inputSchema,
+      )
+    available = definitions.map(_.name.value).toSet
+    result <- Bedrock.dynamicLoop("answer using the available tools", tools)((name, input) =>
+      val toolName = name.unwrap
+      for
+        _ <- ZIO.fail(new IllegalArgumentException(s"unknown tool: $toolName"))
+          .unless(available.contains(toolName))
+        arguments <- ZIO.fromEither(input.asJsonObject)
+          .mapError(message => new IllegalArgumentException(message))
+        response <- mcp.callTool(toolName, arguments)
+        content = response.content.toJson
+        _ <- ZIO.fail(new RuntimeException(content))
+          .when(response.isError.contains(true))
+      yield DynamicToolResult.text(content)
+    )
+    .maxIterations(20)
+    .text
+  yield result
+```
+
+`.text` returns `DynamicLoopResult[String]`; `.asResponse` returns
+`DynamicLoopResult[Output]`. Both expose:
+
+- `output` and the final `stopReason`;
+- `turns: List[LoopTurn]`, including each turn number, stop reason,
+  `TokenUsage`, latency `Metrics`, and requested tool names;
+- `totals`, containing aggregate input/output/total tokens, cache read/write
+  tokens, and summed model latency across all turns.
+
+```scala
+result.turns.foreach: turn =>
+  println(s"turn=${turn.turn} usage=${turn.usage} tools=${turn.toolNames}")
+
+println(s"total usage: ${result.totals.usage}")
+println(s"total model latency: ${result.totals.latencyMs} ms")
+```
+
+`dynamicLoop` owns the full assistant/tool-result history, preserves
+unmodified wire content such as signed reasoning blocks, returns results
+with matching tool-use IDs, dispatches multiple calls in their emitted order,
+and fails with `Bedrock.Error.MaxIterations` at the configured limit.
+Handler failures propagate through the ZIO error channel. To let the model
+recover from a tool failure instead, return a `DynamicToolResult` with
+`status = ToolResultStatus.Error`.
 
 ## Single-turn with tools (`Bedrock.request`)
 

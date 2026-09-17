@@ -39,12 +39,13 @@ private[zio_bedrock_converse] object Tools:
   private def toWireToolConfig(tc: ToolConfig): Wire.ToolConfig =
     Wire.ToolConfig(
       tools = tc.tools.map: t =>
-        Wire.ToolDef.ToolSpec(Wire.ToolSpecData(
-          name        = t.name,
-          description = Some(t.description),
-          strict      = None,
-          schema      = t.inputSchema,
-        )),
+        val base = (t.name, Some(t.description), Option.empty[Boolean])
+        val spec = t.inputSchema match
+          case Bedrock.Tool.SchemaSource.Typed(schema) =>
+            Wire.ToolSpecData(base._1, base._2, base._3, schema)
+          case Bedrock.Tool.SchemaSource.Dynamic(schema) =>
+            Wire.ToolSpecData.dynamic(base._1, base._2, base._3, schema)
+        Wire.ToolDef.ToolSpec(spec),
       toolChoice = Some(tc.toolChoice match
         case ToolChoice.Auto       => Wire.ToolChoice.Auto(Wire.EmptyObject())
         case ToolChoice.Any        => Wire.ToolChoice.Any(Wire.EmptyObject())

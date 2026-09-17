@@ -5,7 +5,9 @@ import com.jamesward.zio_bedrock_converse.internal.{Codecs, Helpers, Http, Toole
 import zio.*
 import zio.direct.*
 import zio.http.{Client as HClient, Status}
+import zio.json.ast.Json
 import zio.schema.annotation.caseName
+import zio.schema.codec.json.schemaJson
 import zio.schema.{DynamicValue, Schema, derived}
 import zio.stream.*
 
@@ -157,6 +159,11 @@ object Bedrock:
     /** Decode this input into the typed `I` via its `Schema`. */
     def as[I: Schema]: Either[String, I] = summon[Schema[I]].fromDynamic(raw)
 
+    /** Decode this input as the raw JSON object emitted by the model. */
+    def asJsonObject: Either[String, Json.Obj] =
+      summon[Schema[Json]].fromDynamic(raw).flatMap: json =>
+        json.asObject.toRight("Tool input must be a JSON object")
+
   object ToolInput:
     /** Wrap a typed value (encoded via its `Schema`) as a `ToolInput`. */
     def from[A: Schema](value: A): ToolInput =
@@ -266,23 +273,28 @@ object Bedrock:
 
   // ---------- Tool ----------
 
-  /** A tool spec advertised to the model. Just the name, description,
-    * and `Schema[I]` of the tool's input — no handler. The handler-bearing
-    * companion (`ToolHandler`) will return when `Bedrock.loop` is
-    * reintroduced; for now, callers run tool calls themselves and
-    * construct `ContentBlock.ToolResult` with the result. */
+  /** A tool specification advertised to the model. Typed tools derive their
+    * input schema from `Schema[I]`; dynamic tools carry a runtime JSON Schema
+    * object verbatim. */
   final class Tool[I] private[zio_bedrock_converse] (
     val name:        ToolName,
     val description: String,
-    private[zio_bedrock_converse] val inputSchema: Schema[?],
+    private[zio_bedrock_converse] val inputSchema: Tool.SchemaSource,
   )
 
   object Tool:
-    /** Build a `Tool` with an explicit name. Public callers usually go
-      * through the `.asTool` extension method, which derives the tool
-      * name from the function reference at compile time. */
+    private[zio_bedrock_converse] enum SchemaSource:
+      case Typed(value: Schema[?])
+      case Dynamic(value: Json.Obj)
+
+    /** Build a typed tool with an explicit name. */
     def apply[I: Schema](name: ToolName, description: String): Tool[I] =
-      new Tool[I](name, description, summon[Schema[I]])
+      new Tool[I](name, description, SchemaSource.Typed(summon[Schema[I]]))
+
+    /** Build a tool from a runtime JSON Schema object. The schema is forwarded
+      * to Bedrock verbatim, enabling dynamic catalogs such as MCP tools/list. */
+    def dynamic(name: ToolName, description: String, inputSchema: Json.Obj): Tool[Json.Obj] =
+      new Tool[Json.Obj](name, description, SchemaSource.Dynamic(inputSchema))
 
   /** `.asTool` extension. Works on any `I => A` (pure) or `I => ZIO[R, E, A]`
     * (effectful) — the function body is discarded; only the function's
@@ -307,6 +319,79 @@ object Bedrock:
     tools:      List[Tool[?]],
     toolChoice: ToolChoice = ToolChoice.Auto,
   )
+
+  /** Result returned by a runtime tool handler. */
+  case class DynamicToolResult(
+    content: List[ToolResultBlock],
+    status: ToolResultStatus = ToolResultStatus.Success,
+  )
+
+  object DynamicToolResult:
+    def text(value: String): DynamicToolResult =
+      DynamicToolResult(List(ToolResultBlock.Text(value)))
+
+  /** Metadata captured for one model turn in a dynamic tool loop. */
+  case class LoopTurn(
+    turn: Int,
+    stopReason: StopReason,
+    usage: TokenUsage,
+    metrics: Metrics,
+    toolNames: List[ToolName],
+  )
+
+  /** Aggregate usage and latency across every model turn. */
+  case class LoopTotals(usage: TokenUsage, latencyMs: Long)
+
+  /** Final output plus complete per-turn and aggregate loop metrics. */
+  case class DynamicLoopResult[+A](
+    output: A,
+    stopReason: StopReason,
+    turns: List[LoopTurn],
+    totals: LoopTotals,
+  ):
+    def map[B](f: A => B): DynamicLoopResult[B] =
+      DynamicLoopResult(f(output), stopReason, turns, totals)
+
+  /** A multi-turn loop over runtime-defined tools. The library owns Converse
+    * history, matching tool-use/result IDs, iteration limits, and metrics. */
+  final class DynamicLoopRequest[R, E] private[zio_bedrock_converse] (
+    prompt: String,
+    tools: List[Tool[?]],
+    handler: (ToolName, ToolInput) => ZIO[R, E, DynamicToolResult],
+    systemMessage: String | Null,
+    config: InferenceConfig | Null,
+    maxTurns: Int,
+  ):
+    def system(value: String): DynamicLoopRequest[R, E] =
+      new DynamicLoopRequest(prompt, tools, handler, value, config, maxTurns)
+
+    def inferenceConfig(value: InferenceConfig): DynamicLoopRequest[R, E] =
+      new DynamicLoopRequest(prompt, tools, handler, systemMessage, value, maxTurns)
+
+    def maxIterations(value: Int): DynamicLoopRequest[R, E] =
+      new DynamicLoopRequest(prompt, tools, handler, systemMessage, config, value)
+
+    def asResponse: ZIO[Client & R, Error | E, DynamicLoopResult[Output]] =
+      com.jamesward.zio_bedrock_converse.internal.LoopImpl.runDynamicLoop(
+        prompt,
+        tools,
+        handler,
+        systemMessage,
+        config,
+        maxTurns,
+      )
+
+    def text: ZIO[Client & R, Error | E, DynamicLoopResult[String]] =
+      asResponse.map(_.map(_.text))
+
+  /** Build a library-managed loop for a runtime tool catalog. */
+  def dynamicLoop[R, E](
+    prompt: String,
+    tools: List[Tool[?]],
+  )(
+    handler: (ToolName, ToolInput) => ZIO[R, E, DynamicToolResult],
+  ): DynamicLoopRequest[R, E] =
+    new DynamicLoopRequest(prompt, tools, handler, null, null, 10)
 
   // ────────────────────────────────────────────────────────────────────
   // High-level: ToolHandler + ModelResponseTool
