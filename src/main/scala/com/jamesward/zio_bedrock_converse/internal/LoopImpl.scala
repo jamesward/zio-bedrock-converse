@@ -80,14 +80,14 @@ private[zio_bedrock_converse] object LoopImpl:
                    totals(allTurns),
                  ))
                else
-                 ZIO.foreach(toolUses) { toolUse =>
+                 ZIO.foreachPar(toolUses) { toolUse =>
                    handler(toolUse.name, new ToolInput(toolUse.input)).map: result =>
                      Helpers.toWireContentBlock(ContentBlock.ToolResult(
                        toolUse.toolUseId,
                        result.content,
                        result.status,
                      ))
-                 }.flatMap: results =>
+                 }.withParallelism(8).flatMap: results =>
                    val resultMessage = Wire.WireMessage(Role.User, results)
                    step(messages :+ response.output.message :+ resultMessage, turn + 1, allTurns))
 
@@ -108,7 +108,7 @@ private[zio_bedrock_converse] object LoopImpl:
             if toolUses.nonEmpty then
               val toolNames = toolUses.map(_.name).mkString(", ")
               ZIO.logDebug(s"[Bedrock.loop] iteration=$iterations tool_use=[$toolNames]") *>
-              ZIO.foreach(toolUses)(dispatchTool(lr, _)).flatMap: results =>
+              ZIO.foreachPar(toolUses)(dispatchTool(lr, _)).withParallelism(8).flatMap: results =>
                 val toolResultMsg = Wire.WireMessage(Role.User, results.toList.map(Wire.ContentBlock.ToolResult.apply))
                 step(messages :+ wire.output.message :+ toolResultMsg, iterations + 1)
             else
@@ -152,7 +152,7 @@ private[zio_bedrock_converse] object LoopImpl:
                     if toolUses.isEmpty then ZIO.succeed(ZStream.empty)
                     else
                       ZIO.logDebug(s"[Bedrock.loop.asStream] iteration=$iterations tool_use=[${toolUses.map(_.name).mkString(", ")}]") *>
-                      ZIO.foreach(toolUses)(dispatchTool(lr, _)).map: results =>
+                      ZIO.foreachPar(toolUses)(dispatchTool(lr, _)).withParallelism(8).map: results =>
                         val assistantMsg = Wire.WireMessage(Role.Assistant, toolUses.map(tu => Wire.ContentBlock.ToolUse(tu)))
                         val toolResultMsg = Wire.WireMessage(Role.User, results.toList.map(Wire.ContentBlock.ToolResult.apply))
                         streamStep(messages :+ assistantMsg :+ toolResultMsg, iterations + 1)
@@ -194,7 +194,7 @@ private[zio_bedrock_converse] object LoopImpl:
                     if toolUses.isEmpty then ZIO.succeed(ZStream.empty)
                     else
                       ZIO.logDebug(s"[Bedrock.loop.stream] iteration=$iterations tool_use=[${toolUses.map(_.name).mkString(", ")}]") *>
-                      ZIO.foreach(toolUses)(dispatchTool(lr, _)).map: results =>
+                      ZIO.foreachPar(toolUses)(dispatchTool(lr, _)).withParallelism(8).map: results =>
                         val assistantMsg = Wire.WireMessage(Role.Assistant, toolUses.map(tu => Wire.ContentBlock.ToolUse(tu)))
                         val toolResultMsg = Wire.WireMessage(Role.User, results.toList.map(Wire.ContentBlock.ToolResult.apply))
                         streamStep(messages :+ assistantMsg :+ toolResultMsg, iterations + 1)

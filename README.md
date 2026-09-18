@@ -153,6 +153,11 @@ Bedrock.loop("…", tools)
 Debug logging is built in at `ZIO.logDebug` level — set your ZIO log
 level to `DEBUG` to see each iteration's tool dispatches and replies.
 
+When one model turn emits multiple tool calls, loop handlers run concurrently
+with a maximum parallelism of 8. Tool results are returned to the model in the
+original tool-use order. Handlers that share mutable state or perform ordered
+side effects must provide their own synchronization.
+
 ## Runtime tools and metrics (`Bedrock.dynamicLoop`)
 
 Use `dynamicLoop` when tool names and input schemas are discovered at

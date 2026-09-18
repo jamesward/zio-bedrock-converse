@@ -12,6 +12,7 @@ import zio.schema.codec.JsonCodec
 import zio.schema.codec.json.schemaJson
 import zio.stream.ZStream
 import zio.test.*
+import zio.test.TestAspect.*
 
 object DynamicToolSpec extends ZIOSpecDefault:
 
@@ -78,6 +79,36 @@ object DynamicToolSpec extends ZIOSpecDefault:
           def sendStream(request: Wire.ConverseRequest) = ZStream.empty
           def sendStreamEvents(request: Wire.ConverseRequest) = ZStream.empty
 
+  private def parallelClient(requests: Ref[List[Wire.ConverseRequest]]): ULayer[Bedrock.Client] =
+    ZLayer.fromZIO:
+      Ref.make(0).map: calls =>
+        new Bedrock.Client:
+          val modelId: ModelId = ModelId("parallel-loop-test")
+
+          def send(request: Wire.ConverseRequest): IO[Bedrock.Error, Wire.ConverseResponse] =
+            requests.update(_ :+ request) *> calls.getAndUpdate(_ + 1).map:
+              case 0 =>
+                val input = summon[Schema[Json]].toDynamic(Json.Obj())
+                Wire.ConverseResponse(
+                  Wire.ConverseOutput(Wire.WireMessage(Role.Assistant, List(
+                    Wire.ContentBlock.ToolUse(Wire.ToolUseContent(ToolUseId("call-a"), ToolName("first"), input)),
+                    Wire.ContentBlock.ToolUse(Wire.ToolUseContent(ToolUseId("call-b"), ToolName("second"), input)),
+                  ))),
+                  StopReason.ToolUse,
+                  TokenUsage(1, 1, 2),
+                  Metrics(1),
+                )
+              case _ =>
+                Wire.ConverseResponse(
+                  Wire.ConverseOutput(Wire.WireMessage(Role.Assistant, List(Wire.ContentBlock.Text("done")))),
+                  StopReason.EndTurn,
+                  TokenUsage(1, 1, 2),
+                  Metrics(1),
+                )
+
+          def sendStream(request: Wire.ConverseRequest) = ZStream.empty
+          def sendStreamEvents(request: Wire.ConverseRequest) = ZStream.empty
+
   def spec = suite("dynamic tools")(
     test("dynamic name and description are forwarded") {
       val tool = Tool.dynamic(ToolName("runtime_search"), "Runtime-provided description", Json.Obj())
@@ -133,6 +164,41 @@ object DynamicToolSpec extends ZIOSpecDefault:
           resultId == assistantId,
         )
     },
+    test("dynamicLoop dispatches same-turn tools in parallel and preserves result order") {
+      val schema = Json.Obj("type" -> Json.Str("object"), "properties" -> Json.Obj())
+      for
+        requests <- Ref.make(List.empty[Wire.ConverseRequest])
+        started <- Ref.make(Set.empty[String])
+        bothStarted <- Promise.make[Nothing, Unit]
+        secondCompleted <- Promise.make[Nothing, Unit]
+        result <- Bedrock.dynamicLoop(
+          "parallel",
+          List(
+            Tool.dynamic(ToolName("first"), "First", schema),
+            Tool.dynamic(ToolName("second"), "Second", schema),
+          ),
+        ) { (name, _) =>
+          val toolName = name.unwrap
+          for
+            size <- started.modify: current =>
+              val next = current + toolName
+              next.size -> next
+            _ <- bothStarted.succeed(()).when(size == 2)
+            _ <- bothStarted.await
+            _ <- if toolName == "first" then secondCompleted.await else secondCompleted.succeed(()).unit
+          yield DynamicToolResult.text(toolName)
+        }.text.provideLayer(parallelClient(requests))
+        captured <- requests.get
+        startedSet <- started.get
+      yield
+        val resultIds = captured.lift(1).toList.flatMap(_.messages.lastOption.toList).flatMap(_.content).collect:
+          case Wire.ContentBlock.ToolResult(value) => value.toolUseId
+        assertTrue(
+          result.output == "done",
+          startedSet.size == 2,
+          resultIds == List(ToolUseId("call-a"), ToolUseId("call-b")),
+        )
+    } @@ timeout(5.seconds) @@ withLiveClock,
     test("dynamic JSON Schema is forwarded verbatim") {
       val rawSchema = Json.Obj(Chunk(
         "type" -> Json.Str("object"),
